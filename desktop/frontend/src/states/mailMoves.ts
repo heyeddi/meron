@@ -95,6 +95,13 @@ function threadIdInFolder(threadId: string, accountId: string | undefined, folde
 // Neighbour of a thread inside the kanban column that holds it (next, or
 // previous if it was last). The chat-view getFilteredThreads list doesn't apply
 // in kanban, where cards live in per-column lists.
+function threadsInPaneColumn(): Message[] {
+  const paneKey = kanban$.paneColumnKey.get()
+  const split = paneKey.indexOf('\n')
+  if (split === -1) return []
+  return kanban$.threads[paneKey.slice(split + 1)].get() ?? []
+}
+
 function kanbanNeighbourThreadId(threadId: string): string {
   for (const threads of Object.values(kanban$.threads.get())) {
     const index = threads.findIndex((thread) => thread.thread_id === threadId)
@@ -102,7 +109,9 @@ function kanbanNeighbourThreadId(threadId: string): string {
     const neighbour = threads[index + 1] ?? threads[index - 1]
     return neighbour?.thread_id ?? ''
   }
-  return ''
+  // The open card is already off the board (a column reload dropped it). Stay
+  // on a card still in that column instead of closing the conversation.
+  return threadsInPaneColumn().find((thread) => thread.thread_id !== threadId)?.thread_id ?? ''
 }
 
 function removeThreadLocally(threadId: string) {

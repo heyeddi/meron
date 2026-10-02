@@ -383,6 +383,12 @@ export function dropLocallyRemovedThreads(
   return threads.filter((thread) => !removedAtEpoch.has(thread.thread_id))
 }
 
+// A kanban column reload is a separate list from `loadThreads`. It still has to
+// hide a card this session already archived, or the next sync paints it back.
+export function omitLocallyRemovedThreads(threads: Message[]): Message[] {
+  return dropLocallyRemovedThreads(threads, [], 0, false)
+}
+
 // `mail.threadList` uses this when the client doesn't pass a limit. The
 // background merge needs it to tell a full first page from the end of the folder.
 export const THREAD_LIST_PAGE_SIZE = 50

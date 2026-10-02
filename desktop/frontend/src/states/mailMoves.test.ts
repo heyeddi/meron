@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import type { Message } from '../types'
 import './accounts'
+import { kanban$ } from './kanban'
 import { mail$ } from './mail'
 import { markUnreadWithUndo } from './mailFlags'
 import { archiveThread, deleteThread, moveThreadToFolder } from './mailMoves'
@@ -65,6 +66,10 @@ describe('undo after moving a thread', () => {
 
   afterEach(() => {
     ;(window as any).go = previousGo
+    kanban$.activeBoardId.set('')
+    kanban$.paneThreadId.set('')
+    kanban$.paneColumnKey.set('')
+    kanban$.threads.set({})
   })
 
   async function runUndo() {
@@ -160,6 +165,28 @@ describe('undo after moving a thread', () => {
     await first
     expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['a', 'c'])
     expect(ui$.selectedThread.get()).toBe('c')
+  })
+
+  it('stays on a card when the archived thread is already off the board', async () => {
+    const next = thread({ id: 'b', thread_id: 'b', date: 20, account_id: 'acc', folder_id: 'INBOX' })
+    kanban$.activeBoardId.set('board')
+    kanban$.paneColumnKey.set('board\nacc\nINBOX')
+    kanban$.paneThreadId.set('missing')
+    kanban$.threads['acc\nINBOX'].set([next, thread({ id: 'c', thread_id: 'c', date: 10 })])
+    ui$.selectedThread.set('missing')
+    mail$.threads.set([])
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: () => new Promise(() => {}),
+        },
+      },
+    }
+
+    void archiveThread('missing')
+    await Promise.resolve()
+    expect(ui$.selectedThread.get()).toBe('b')
+    expect(kanban$.paneThreadId.get()).toBe('b')
   })
 
   it('stays on a visible row when the archived thread is already off the list', async () => {
