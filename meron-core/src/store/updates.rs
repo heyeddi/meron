@@ -348,6 +348,9 @@ pub fn delete_messages_by_uid(
             params![account, folder, *uid],
         )?;
     }
+    // Even when the row was already gone: a sync that fetched it first can
+    // still be holding the header and would insert it again.
+    remember_removed_uids(conn, account, folder, uids)?;
     Ok(deleted)
 }
 

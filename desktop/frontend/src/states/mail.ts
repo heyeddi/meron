@@ -335,6 +335,81 @@ export function listFilterKey(mode = ui$.filterMode.get(), attachments = ui$.att
   return attachments ? `${mode}+attachments` : mode
 }
 
+// Thread ids removed locally (archive, move, delete) and not yet seen again in
+// a folder fetch. A refresh that started before the removal still has the row
+// in its snapshot; without this it writes the row back, including one the
+// reader had scrolled past the first page.
+// Bumped on every local removal. A list load records the value at its start, so
+// a fetch that began before the removal cannot treat its stale copy as the
+// thread coming back.
+let listMutationEpoch = 0
+const removedAtEpoch = new Map<string, number>()
+
+export function suppressRemovedThread(threadId: string): () => void {
+  if (!threadId) return () => {}
+  listMutationEpoch += 1
+  const epoch = listMutationEpoch
+  removedAtEpoch.set(threadId, epoch)
+  return () => {
+    if (removedAtEpoch.get(threadId) === epoch) removedAtEpoch.delete(threadId)
+  }
+}
+
+// Forget a local removal so a later list may show the thread again. Undo calls
+// this; a background refresh must not, because the cache still has the row
+// until the move finishes and a sync can write that stale copy back.
+export function releaseRemovedThread(threadId: string) {
+  if (threadId) removedAtEpoch.delete(threadId)
+}
+
+// Drop threads still marked removed. `allowRelease` is only for a load the user
+// started (opening the folder, not a sync). That load clears the mark when it
+// began after the removal and the row is in its result — the thread really is
+// in the folder again. A sync refresh never clears it, so the row the move has
+// not deleted yet cannot land back on the list.
+export function dropLocallyRemovedThreads(
+  threads: Message[],
+  fetched: Message[],
+  loadEpoch: number,
+  allowRelease: boolean,
+): Message[] {
+  if (allowRelease) {
+    for (const thread of fetched) {
+      const removed = removedAtEpoch.get(thread.thread_id)
+      if (removed !== undefined && removed <= loadEpoch) removedAtEpoch.delete(thread.thread_id)
+    }
+  }
+  if (removedAtEpoch.size === 0) return threads
+  return threads.filter((thread) => !removedAtEpoch.has(thread.thread_id))
+}
+
+// `mail.threadList` uses this when the client doesn't pass a limit. The
+// background merge needs it to tell a full first page from the end of the folder.
+export const THREAD_LIST_PAGE_SIZE = 50
+
+// A background refresh only re-reads the first page. Threads it no longer
+// returns left that page (archived, moved, deleted). Threads older than the
+// page are ones the reader scrolled to, and this refresh didn't look at them.
+// Threads that slide into the page, or that actually just arrived, join by
+// date. Putting them on the front is how an older conversation from another
+// account landed above newer mail after an archive.
+export function mergeRefreshedThreadPage(previous: Message[], fetched: Message[]): Message[] {
+  if (fetched.length === 0) return previous
+  const fetchedById = new Map(fetched.map((thread) => [thread.thread_id, thread]))
+  const previousIds = new Set(previous.map((thread) => thread.thread_id))
+  const brandNew = fetched.filter((thread) => !previousIds.has(thread.thread_id))
+  const oldest = Math.min(...fetched.map((thread) => thread.date))
+  const pageFull = fetched.length >= THREAD_LIST_PAGE_SIZE
+  const kept = previous.filter((thread) => {
+    if (fetchedById.has(thread.thread_id)) return true
+    if (!pageFull) return false
+    return thread.date < oldest
+  })
+  const updated = kept.map((thread) => fetchedById.get(thread.thread_id) ?? thread)
+  const merged = brandNew.length > 0 ? [...brandNew, ...updated] : updated
+  return merged.length < 2 ? merged : merged.sort((a, b) => b.date - a.date)
+}
+
 // Encoded t. keys include the subject branch and are stable across folders.
 // Numeric IMAP UIDs and RSS item ids remain tied to their original location.
 function starredConversationIdentity(thread: Message): string {
@@ -344,6 +419,7 @@ function starredConversationIdentity(thread: Message): string {
 }
 
 export async function loadThreads(refresh = true, searchStage: ThreadSearchStage = 'auto') {
+  const loadEpoch = listMutationEpoch
   // A Kanban card temporarily points selectedFolder at the card's real mailbox
   // so thread actions have the right context. The normal mail list is hidden,
   // and treating that account-specific id as a unified role falls back to Inbox,
@@ -443,7 +519,6 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     return stale
   }
   const previousThreads = mail$.threads.get()
-  const currentSelected = ui$.selectedThread.get()
   const previousThreadsCursor = mail$.threadsCursor.get()
   const previousAccountCursors = snapshotRecord(mail$.threadAccountCursors.get())
   const userInitiated = refresh || searchStage === 'cache'
@@ -559,12 +634,32 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     }
   }
 
+  const fetchedThreads = allThreads
+  if (mergeBackground) {
+    // Update the threads we already show with their fresh copies (new unread
+    // counts, latest message, etc.), keep the extra pages the user loaded by
+    // scrolling, and prepend any threads that are brand-new since the last load.
+    // A thread the fresh page no longer has left the folder — keeping it is how
+    // an archived thread came back and then refused to archive again.
+    allThreads = mergeRefreshedThreadPage(previousThreads, fetchedThreads)
+    // Keep the cursor pointing past the last loaded page rather than resetting it
+    // to the first page's cursor.
+    mail$.threadsCursor.set(previousThreadsCursor)
+    mail$.threadAccountCursors.set(previousAccountCursors)
+  }
+
+  // Read selection here, not at the start of the load. Archiving the open
+  // thread moves it to the neighbour while this load is in flight; deciding
+  // from the old id would put that thread back or close the one that replaced it.
+  // Done after the merge so pinning the open row can't make the fresh page look
+  // longer than it is and keep threads that actually left.
+  const selectedNow = ui$.selectedThread.get()
   if (
     (filter !== 'all' || attachments) &&
-    currentSelected &&
-    !allThreads.some((thread) => thread.thread_id === currentSelected)
+    selectedNow &&
+    !allThreads.some((thread) => thread.thread_id === selectedNow)
   ) {
-    const selectedThread = previousThreads.find((thread) => thread.thread_id === currentSelected)
+    const selectedThread = previousThreads.find((thread) => thread.thread_id === selectedNow)
     const replacement =
       selectedThread &&
       allThreads.some((thread) => starredConversationIdentity(thread) === starredConversationIdentity(selectedThread))
@@ -576,22 +671,12 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     }
   }
 
-  if (mergeBackground) {
-    // Update the threads we already show with their fresh copies (new unread
-    // counts, latest message, etc.), keep the extra pages the user loaded by
-    // scrolling, and prepend any threads that are brand-new since the last load.
-    // This preserves both the list length and the user's scroll position.
-    const fetched = new Map(allThreads.map((thread) => [thread.thread_id, thread]))
-    const previousIds = new Set(previousThreads.map((thread) => thread.thread_id))
-    const brandNew = allThreads.filter((thread) => !previousIds.has(thread.thread_id))
-    const updated = previousThreads.map((thread) => fetched.get(thread.thread_id) ?? thread)
-    allThreads = brandNew.length > 0 ? [...brandNew, ...updated] : updated
-    // Keep the cursor pointing past the last loaded page rather than resetting it
-    // to the first page's cursor.
-    mail$.threadsCursor.set(previousThreadsCursor)
-    mail$.threadAccountCursors.set(previousAccountCursors)
-  }
-
+  allThreads = dropLocallyRemovedThreads(
+    allThreads,
+    fetchedThreads,
+    loadEpoch,
+    refresh && searchStage !== 'cache',
+  )
   mail$.threads.set(allThreads)
   // These rows now stand for this view — but only a load that went to the server
   // for them may say so, which is what `refresh` marks. The two cache-only kinds
@@ -635,7 +720,7 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
   if (kanban$.activeBoardId.get()) {
     return
   }
-  if (!currentSelected) {
+  if (!selectedNow) {
     // Only a flow that just cleared the selection may fill it (see
     // `requestThreadReselect`); an empty pane otherwise stays empty.
     if (reselect) ui$.selectedThread.set(filtered[0]?.thread_id ?? '')
@@ -646,7 +731,7 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     // scrolled down to and opened from a later page would look "missing" and
     // get closed a second or two later.
     userInitiated &&
-    !allThreads.some((thread) => thread.thread_id === currentSelected) &&
+    !allThreads.some((thread) => thread.thread_id === selectedNow) &&
     // A selection whose conversation is still being fetched — a notification or
     // starred jump that set account, folder and thread together — isn't missing,
     // it just hasn't landed. Only close one that has settled.
@@ -654,7 +739,7 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     // A thread tab on screen owns the selection (it renders only while the two
     // match) and needn't be in this folder's list: it was opened from elsewhere,
     // e.g. a kanban card in another folder, and closing it is the tab's call.
-    !activeThreadTabOwns(currentSelected)
+    !activeThreadTabOwns(selectedNow)
   ) {
     // The thread the user was reading is not in this view: close the pane rather
     // than opening an unrelated one for them.

@@ -47,9 +47,9 @@ func (a *App) trayReady() {
 	systray.SetIcon(trayIcon(a.currentTrayUnread()))
 	if runtime.GOOS != "darwin" {
 		// On macOS the title renders as text beside the menu bar icon.
-		systray.SetTitle("Meron")
+		systray.SetTitle(appTitle())
 	}
-	systray.SetTooltip("Meron")
+	systray.SetTooltip(appTitle())
 	systray.SetOnTapped(func() {
 		a.showMainWindow()
 	})

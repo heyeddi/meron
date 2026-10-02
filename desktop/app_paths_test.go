@@ -27,6 +27,9 @@ func TestAppDirsUseProductionProfileByDefault(t *testing.T) {
 	if got, want := appDirName(), "meron"; got != want {
 		t.Fatalf("appDirName() = %q, want %q", got, want)
 	}
+	if got, want := appTitle(), "Meron"; got != want {
+		t.Fatalf("appTitle() = %q, want %q", got, want)
+	}
 	if got, want := appUniqueID(), "jp.nonbili.meron"; got != want {
 		t.Fatalf("appUniqueID() = %q, want %q", got, want)
 	}
@@ -57,6 +60,9 @@ func TestAppDirsUseDevProfileForWailsDev(t *testing.T) {
 
 	if got, want := appDirName(), "meron-dev"; got != want {
 		t.Fatalf("appDirName() = %q, want %q", got, want)
+	}
+	if got, want := appTitle(), "Meron-dev"; got != want {
+		t.Fatalf("appTitle() = %q, want %q", got, want)
 	}
 	if got, want := appUniqueID(), "jp.nonbili.meron-dev"; got != want {
 		t.Fatalf("appUniqueID() = %q, want %q", got, want)

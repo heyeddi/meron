@@ -534,6 +534,9 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<()> {
     if version < 13 {
         migrate_v13(&tx)?;
     }
+    if version < 14 {
+        migrate_v14(&tx)?;
+    }
 
     tx.commit()?;
     Ok(())
@@ -786,6 +789,23 @@ fn migrate_v13(conn: &Connection) -> Result<()> {
          END;",
     )?;
     conn.execute_batch("PRAGMA user_version = 13;")?;
+    Ok(())
+}
+
+/// UIDs this process removed from a folder. A folder sync that fetched its
+/// snapshot before the removal must not write those rows back, or an archived
+/// thread reappears in the mailbox it just left.
+fn migrate_v14(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS removed_message_uids (
+           account TEXT NOT NULL,
+           folder  TEXT NOT NULL,
+           uid     INTEGER NOT NULL,
+           epoch   INTEGER NOT NULL,
+           PRIMARY KEY (account, folder, uid)
+         ) WITHOUT ROWID;",
+    )?;
+    conn.execute_batch("PRAGMA user_version = 14;")?;
     Ok(())
 }
 

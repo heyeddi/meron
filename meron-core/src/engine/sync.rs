@@ -509,7 +509,7 @@ async fn sync_messages_with_policy(
     let prepare_engine = engine.clone();
     let prepare_account = account.to_string();
     let prepare_folder = folder.to_string();
-    let (prior_modseq, prior_validity) = tokio::task::spawn_blocking(move || {
+    let (prior_modseq, prior_validity, removed_epoch) = tokio::task::spawn_blocking(move || {
         let engine = prepare_engine;
         let account = prepare_account.as_str();
         let folder = prepare_folder.as_str();
@@ -521,7 +521,11 @@ async fn sync_messages_with_policy(
         let validity = store::get_folder_state(&db, account, folder)?
             .map(|(v, _)| v)
             .unwrap_or(0);
-        anyhow::Ok((modseq, validity))
+        // Removals after this point (an archive that lands while the fetch is
+        // still on the wire) get a higher epoch. This snapshot must not write
+        // those UIDs back.
+        let removed_epoch = store::removed_message_epoch(&db)?;
+        anyhow::Ok((modseq, validity, removed_epoch))
     })
     .await??;
 
@@ -612,6 +616,8 @@ async fn sync_messages_with_policy(
     }
     let clear_time = phase_started.elapsed();
     let phase_started = std::time::Instant::now();
+    let fetched_uids: Vec<u32> = batch.messages.iter().map(|message| message.uid).collect();
+    store::release_removed_messages(&db, account, folder, &fetched_uids, removed_epoch)?;
     store::upsert_messages(&db, account, folder, &batch.messages)?;
     let upsert_time = phase_started.elapsed();
     // Make sure the folder is represented in the folders table so its unread
