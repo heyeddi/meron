@@ -128,6 +128,57 @@ describe('undo after moving a thread', () => {
     })
   })
 
+  it('keeps later archives when an earlier one fails', async () => {
+    const older = thread({ id: 'c', thread_id: 'c', date: 10 })
+    const middle = thread({ id: 'b', thread_id: 'b', date: 20 })
+    const newest = thread({ id: 'a', thread_id: 'a', date: 30 })
+    mail$.threads.set([newest, middle, older])
+    ui$.selectedThread.set('a')
+    let rejectFirst: (error: Error) => void = () => {}
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: (command: string, payload: { thread_id?: string }) => {
+            if (command === 'mail.archive' && payload.thread_id === 'a') {
+              return new Promise((_resolve, reject) => {
+                rejectFirst = reject
+              })
+            }
+            return new Promise(() => {})
+          },
+        },
+      },
+    }
+
+    const first = archiveThread('a')
+    void archiveThread('b')
+    await Promise.resolve()
+    expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['c'])
+    expect(ui$.selectedThread.get()).toBe('c')
+
+    rejectFirst(new Error('archive failed'))
+    await first
+    expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['a', 'c'])
+    expect(ui$.selectedThread.get()).toBe('c')
+  })
+
+  it('stays on a visible row when the archived thread is already off the list', async () => {
+    const next = thread({ id: 'b', thread_id: 'b', date: 20 })
+    mail$.threads.set([next, thread({ id: 'c', thread_id: 'c', date: 10 })])
+    ui$.selectedThread.set('missing')
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: () => new Promise(() => {}),
+        },
+      },
+    }
+
+    void archiveThread('missing')
+    await Promise.resolve()
+    expect(ui$.selectedThread.get()).toBe('b')
+  })
+
   it('offers undo for mark unread only once it has landed', async () => {
     markUnreadWithUndo(THREAD)
     await new Promise((resolve) => setTimeout(resolve, 0))

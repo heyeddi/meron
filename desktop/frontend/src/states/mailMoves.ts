@@ -17,7 +17,6 @@ import {
   releaseRemovedThread,
   suppressRemovedThread,
   requestThreadReselect,
-  restoreKanbanColumns,
   uniqueThreadItems,
   updateKanbanThread,
 } from './mail'
@@ -124,10 +123,12 @@ function removeThreadLocally(threadId: string) {
       const visible = getFilteredThreads()
       const index = visible.findIndex((thread) => thread.thread_id === threadId)
       // Skip over rows of the deleted thread itself — the unified starred folder
-      // can list the same thread once per folder it is starred in.
+      // can list the same thread once per folder it is starred in. When the
+      // open row is already gone (a refresh dropped it mid-burst), stay on the
+      // first row still on screen instead of clearing the conversation.
       const neighbour =
         index === -1
-          ? undefined
+          ? visible.find((item) => item.thread_id !== threadId)
           : (visible.slice(index + 1).find((item) => item.thread_id !== threadId) ??
             visible
               .slice(0, index)
@@ -156,19 +157,73 @@ function removeThreadLocally(threadId: string) {
   return {
     rollback: () => {
       unsuppress()
-      mail$.threads.set(previousThreads)
-      mail$.messages.set(previousMessages)
-      restoreKanbanColumns(previousKanbanThreads)
-      ui$.selectedThread.set(previousSelected)
-      if (previousPaneThreadId === threadId) {
+      // Put this thread back only. Restoring the whole list would resurrect
+      // threads archived after this one started, which is what a fast burst
+      // looks like when an earlier move fails.
+      const thread = previousThreads.find((item) => item.thread_id === threadId)
+      const currentThreads = mail$.threads.get()
+      if (thread && !currentThreads.some((item) => item.thread_id === threadId)) {
+        mail$.threads.set([...currentThreads, thread].sort((a, b) => b.date - a.date))
+      }
+      const currentMessages = mail$.messages.get()
+      const seenMessages = new Set(currentMessages.map((message) => message.id))
+      const missingMessages = previousMessages.filter(
+        (message) => message.thread_id === threadId && !seenMessages.has(message.id),
+      )
+      if (missingMessages.length > 0) mail$.messages.set([...currentMessages, ...missingMessages])
+      for (const [key, columnThreads] of previousKanbanThreads) {
+        if (!columnThreads) continue
+        const card = columnThreads.find((item) => item.thread_id === threadId)
+        if (!card) continue
+        const column = kanban$.threads[key].get()
+        if (!column) {
+          kanban$.threads[key].set([card])
+          continue
+        }
+        if (!column.some((item) => item.thread_id === threadId)) {
+          kanban$.threads[key].set([...column, card])
+        }
+      }
+      // The reader may already have archived the neighbour. Only come back
+      // here when the selection is still the one this removal chose.
+      if (ui$.selectedThread.get() === nextSelected) ui$.selectedThread.set(previousSelected)
+      if (previousPaneThreadId === threadId && kanban$.paneThreadId.get() === nextSelected) {
         kanban$.paneThreadId.set(previousPaneThreadId)
       }
     },
   }
 }
 
+// One list rewrite for a burst of archives. Each move waits on IMAP for a few
+// seconds and then reloads; letting every one of those land repaints the list
+// out from under the selection the reader has already moved past.
+let backgroundListRefresh: Promise<void> | null = null
+let backgroundListRefreshAgain = false
+
+function coalescedBackgroundListRefresh(): Promise<void> {
+  if (!backgroundListRefresh) backgroundListRefresh = drainBackgroundListRefresh()
+  else backgroundListRefreshAgain = true
+  return backgroundListRefresh
+}
+
+async function drainBackgroundListRefresh() {
+  try {
+    do {
+      backgroundListRefreshAgain = false
+      await loadThreads(false)
+    } while (backgroundListRefreshAgain)
+  } finally {
+    backgroundListRefresh = null
+    if (backgroundListRefreshAgain) {
+      backgroundListRefreshAgain = false
+      void coalescedBackgroundListRefresh()
+    }
+  }
+}
+
 async function refreshThreadLocation(accountId?: string, refresh = false) {
-  await loadThreads(refresh)
+  if (refresh) await loadThreads(true)
+  else await coalescedBackgroundListRefresh()
   const selectedAcc = ui$.selectedAccount.get()
   if (selectedAcc) {
     void loadFolders(selectedAcc, false)

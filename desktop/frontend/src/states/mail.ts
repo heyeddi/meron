@@ -390,24 +390,45 @@ export const THREAD_LIST_PAGE_SIZE = 50
 // A background refresh only re-reads the first page. Threads it no longer
 // returns left that page (archived, moved, deleted). Threads older than the
 // page are ones the reader scrolled to, and this refresh didn't look at them.
-// Threads that slide into the page, or that actually just arrived, join by
-// date. Putting them on the front is how an older conversation from another
+// A short page still has those when the server sent a cursor — the unified
+// inbox stops at a date cutoff before the page is full. Only a short page with
+// nowhere further to read has covered the folder, and then a missing row is
+// gone. Threads that slide into the page, or that actually just arrived, join
+// by date. Putting them on the front is how an older conversation from another
 // account landed above newer mail after an archive.
-export function mergeRefreshedThreadPage(previous: Message[], fetched: Message[]): Message[] {
+export function mergeRefreshedThreadPage(previous: Message[], fetched: Message[], hasMore = false): Message[] {
   if (fetched.length === 0) return previous
   const fetchedById = new Map(fetched.map((thread) => [thread.thread_id, thread]))
   const previousIds = new Set(previous.map((thread) => thread.thread_id))
   const brandNew = fetched.filter((thread) => !previousIds.has(thread.thread_id))
   const oldest = Math.min(...fetched.map((thread) => thread.date))
-  const pageFull = fetched.length >= THREAD_LIST_PAGE_SIZE
+  const pageCoversRest = fetched.length < THREAD_LIST_PAGE_SIZE && !hasMore
   const kept = previous.filter((thread) => {
     if (fetchedById.has(thread.thread_id)) return true
-    if (!pageFull) return false
+    if (pageCoversRest) return false
     return thread.date < oldest
   })
   const updated = kept.map((thread) => fetchedById.get(thread.thread_id) ?? thread)
   const merged = brandNew.length > 0 ? [...brandNew, ...updated] : updated
   return merged.length < 2 ? merged : merged.sort((a, b) => b.date - a.date)
+}
+
+// The open conversation left the list this refresh just wrote. Follow it to the
+// next row that is still on screen (or the previous one, if it was last) so a
+// burst of archives doesn't land on a blank pane. A selection that was never in
+// this list — a notification that hasn't landed — stays where it is.
+export function nextSelectedAfterRefresh(previous: Message[], visible: Message[], selectedId: string): string {
+  if (!selectedId || visible.some((thread) => thread.thread_id === selectedId)) return selectedId
+  const index = previous.findIndex((thread) => thread.thread_id === selectedId)
+  if (index === -1) return selectedId
+  const visibleIds = new Set(visible.map((thread) => thread.thread_id))
+  const after = previous.slice(index + 1).find((thread) => visibleIds.has(thread.thread_id))
+  if (after) return after.thread_id
+  const before = previous
+    .slice(0, index)
+    .reverse()
+    .find((thread) => visibleIds.has(thread.thread_id))
+  return before?.thread_id ?? visible[0]?.thread_id ?? ''
 }
 
 // Encoded t. keys include the subject branch and are stable across folders.
@@ -638,10 +659,13 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
   if (mergeBackground) {
     // Update the threads we already show with their fresh copies (new unread
     // counts, latest message, etc.), keep the extra pages the user loaded by
-    // scrolling, and prepend any threads that are brand-new since the last load.
+    // scrolling, and fold in threads that are new since the last load.
     // A thread the fresh page no longer has left the folder — keeping it is how
-    // an archived thread came back and then refused to archive again.
-    allThreads = mergeRefreshedThreadPage(previousThreads, fetchedThreads)
+    // an archived thread came back and then refused to archive again. The cursor
+    // is read first: restoring the scrolled cursor below would hide that this
+    // page still has mail under it.
+    const fetchedHasMore = mail$.threadsCursor.get() !== ''
+    allThreads = mergeRefreshedThreadPage(previousThreads, fetchedThreads, fetchedHasMore)
     // Keep the cursor pointing past the last loaded page rather than resetting it
     // to the first page's cursor.
     mail$.threadsCursor.set(previousThreadsCursor)
@@ -678,6 +702,20 @@ export async function loadThreads(refresh = true, searchStage: ThreadSearchStage
     refresh && searchStage !== 'cache',
   )
   mail$.threads.set(allThreads)
+  // A background refresh can drop the row the selection just moved to (a short
+  // page, or a neighbour archived while this load was in flight). Leaving the
+  // id in place shows a blank conversation. Follow the row that is still here.
+  // A load the user started still closes the pane below, on purpose.
+  if (
+    !userInitiated &&
+    selectedNow &&
+    !allThreads.some((thread) => thread.thread_id === selectedNow) &&
+    !mail$.threadLoading.get() &&
+    !activeThreadTabOwns(selectedNow)
+  ) {
+    const nextSelected = nextSelectedAfterRefresh(previousThreads, allThreads, selectedNow)
+    if (nextSelected !== selectedNow) ui$.selectedThread.set(nextSelected)
+  }
   // These rows now stand for this view — but only a load that went to the server
   // for them may say so, which is what `refresh` marks. The two cache-only kinds
   // both answer from the local index, so an empty result from either means "not

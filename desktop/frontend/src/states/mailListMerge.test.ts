@@ -4,6 +4,7 @@ import {
   THREAD_LIST_PAGE_SIZE,
   dropLocallyRemovedThreads,
   mergeRefreshedThreadPage,
+  nextSelectedAfterRefresh,
   releaseRemovedThread,
   suppressRemovedThread,
 } from './mail'
@@ -64,6 +65,48 @@ describe('mergeRefreshedThreadPage', () => {
     expect(mergeRefreshedThreadPage(previous, [])).toEqual(previous)
   })
 
+  it('keeps scrolled threads when a short page still has more below', () => {
+    const previous = [row('top', 30), row('open', 20), row('scrolled', 1)]
+    const fetched = [row('top', 30)]
+    expect(mergeRefreshedThreadPage(previous, fetched, true).map((thread) => thread.thread_id)).toEqual([
+      'top',
+      'open',
+      'scrolled',
+    ])
+  })
+
+  it('drops scrolled threads when a short page is the end of the folder', () => {
+    const previous = [row('top', 30), row('open', 20), row('scrolled', 1)]
+    const fetched = [row('top', 30)]
+    expect(mergeRefreshedThreadPage(previous, fetched, false).map((thread) => thread.thread_id)).toEqual(['top'])
+  })
+})
+
+describe('nextSelectedAfterRefresh', () => {
+  it('follows the open conversation to the next row the refresh kept', () => {
+    const previous = [row('archived', 30), row('open', 20), row('next', 10)]
+    const visible = [row('next', 10)]
+    expect(nextSelectedAfterRefresh(previous, visible, 'open')).toBe('next')
+  })
+
+  it('steps backward when the open thread was the last row kept', () => {
+    const previous = [row('prev', 20), row('open', 10)]
+    const visible = [row('prev', 20)]
+    expect(nextSelectedAfterRefresh(previous, visible, 'open')).toBe('prev')
+  })
+
+  it('leaves a selection that was never in this list', () => {
+    const visible = [row('next', 10)]
+    expect(nextSelectedAfterRefresh([], visible, 'notification')).toBe('notification')
+  })
+
+  it('clears the selection when the refresh kept nothing', () => {
+    const previous = [row('open', 10)]
+    expect(nextSelectedAfterRefresh(previous, [], 'open')).toBe('')
+  })
+})
+
+describe('dropLocallyRemovedThreads', () => {
   it('keeps an archived thread out of a background refresh that still has the row', () => {
     const archived = row('acc#INBOX#t.archived', 5)
     const neighbour = row('acc#INBOX#t.neighbour', 4)
