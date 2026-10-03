@@ -853,7 +853,7 @@ describe('deleteThread', () => {
     await deleteThread('acc:inbox:thread:1')
 
     const threadListCall = calls.find((call) => call.command === 'mail.threadList')
-    expect(threadListCall?.payload).toMatchObject({ refresh: true })
+    expect(threadListCall?.payload).toMatchObject({ refresh: false })
     expect(mail$.threads.get()).toHaveLength(1)
     expect(ui$.toastTone.get()).toBe('error')
     expect(ui$.toast.get()).toBe('Delete failed: thread is still in this folder')
@@ -866,7 +866,7 @@ describe('deleteThread', () => {
     await deleteThread('acc:inbox:thread:1')
 
     const threadListCall = calls.find((call) => call.command === 'mail.threadList')
-    expect(threadListCall?.payload).toMatchObject({ refresh: true })
+    expect(threadListCall?.payload).toMatchObject({ refresh: false })
     expect(mail$.threads.get()).toHaveLength(0)
     expect(ui$.toastTone.get()).toBe('success')
     expect(ui$.toast.get()).toBe('Thread moved to Trash')

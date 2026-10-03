@@ -158,7 +158,9 @@ pub fn get_folder_unread(conn: &Connection, account: &str, folder: &str) -> Resu
 }
 
 /// Replace the folder's `uncached_unseen` rows with the members of
-/// `unseen` (the server's unseen UIDs) that aren't cached.
+/// `unseen` (the server's unseen UIDs) that aren't cached or guarded by a
+/// removal marker. The snapshot guard retains concurrent removals until this
+/// write completes, as it does for header and body persistence.
 pub fn set_uncached_unseen(
     conn: &Connection,
     account: &str,
@@ -172,6 +174,8 @@ pub fn set_uncached_unseen(
     let mut insert = conn.prepare_cached(
         "INSERT INTO uncached_unseen(account, folder, uid)
          SELECT ?1, ?2, ?3 WHERE NOT EXISTS (SELECT 1 FROM messages
+           WHERE account = ?1 AND folder = ?2 AND uid = ?3)
+         AND NOT EXISTS (SELECT 1 FROM removed_message_uids
            WHERE account = ?1 AND folder = ?2 AND uid = ?3)",
     )?;
     for uid in unseen {

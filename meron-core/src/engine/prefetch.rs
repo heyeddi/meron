@@ -61,6 +61,7 @@ pub async fn prefetch_bodies_with_options(
     folder: &str,
     options: BodyPrefetchOptions,
 ) -> anyhow::Result<usize> {
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     engine
         .with_read_session(account, |session| {
             let engine = engine.clone();
@@ -134,6 +135,7 @@ pub async fn fetch_bodies_for_uids(
     if pending.is_empty() {
         return Ok(0);
     }
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     engine
         .with_read_session(account, |session| {
             let engine = engine.clone();

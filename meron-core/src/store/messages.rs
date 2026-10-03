@@ -749,6 +749,48 @@ pub fn release_removed_messages(
     Ok(())
 }
 
+/// Register a folder sync before network I/O. The temporary table belongs to
+/// this connection/process, so abandoned snapshots cannot survive a restart.
+/// Registration and cleanup run under the engine's database lock.
+pub fn begin_message_sync(conn: &Connection) -> Result<(i64, i64)> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS active_message_syncs (
+           id INTEGER PRIMARY KEY AUTOINCREMENT,
+           epoch INTEGER NOT NULL
+         );",
+    )?;
+    let tx = conn.unchecked_transaction()?;
+    let epoch = removed_message_epoch(&tx)?;
+    tx.execute(
+        "INSERT INTO active_message_syncs(epoch) VALUES(?1)",
+        params![epoch],
+    )?;
+    let id = tx.last_insert_rowid();
+    prune_removed_message_markers(&tx)?;
+    tx.commit()?;
+    Ok((id, epoch))
+}
+
+/// A finished, failed or cancelled sync no longer needs its removal markers.
+pub fn end_message_sync(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "DELETE FROM active_message_syncs WHERE id = ?1",
+        params![id],
+    )?;
+    prune_removed_message_markers(conn)
+}
+
+fn prune_removed_message_markers(conn: &Connection) -> Result<()> {
+    // A snapshot begun at E cannot contain a UID removed before or at E.
+    // Keep all later removals until the oldest active snapshot has finished.
+    conn.execute(
+        "DELETE FROM removed_message_uids
+         WHERE epoch <= COALESCE((SELECT MIN(epoch) FROM active_message_syncs), ?1)",
+        params![removed_message_epoch(conn)?],
+    )?;
+    Ok(())
+}
+
 fn removed_uids_in(conn: &Connection, account: &str, folder: &str) -> Result<HashSet<u32>> {
     let mut stmt =
         conn.prepare("SELECT uid FROM removed_message_uids WHERE account = ?1 AND folder = ?2")?;
@@ -1027,7 +1069,11 @@ pub fn save_cached_message(
 
     conn.execute(
         "INSERT INTO messages (account, folder, msg_id, uid, subject, from_name, from_addr, date, body, json, files)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+         SELECT ?1, ?2, ?3, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+         WHERE NOT EXISTS (
+           SELECT 1 FROM removed_message_uids
+           WHERE account = ?1 AND folder = ?2 AND uid = ?3
+         )
          ON CONFLICT(account, folder, msg_id) DO UPDATE SET
            subject = excluded.subject,
            from_name = excluded.from_name,

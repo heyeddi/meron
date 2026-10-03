@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import type { Message } from '../types'
 import './accounts'
 import { kanban$ } from './kanban'
-import { mail$ } from './mail'
+import { mail$, releaseRemovedThread } from './mail'
 import { markUnreadWithUndo } from './mailFlags'
 import { archiveThread, deleteThread, moveThreadToFolder } from './mailMoves'
 import { ui$ } from './ui'
@@ -65,6 +65,7 @@ describe('undo after moving a thread', () => {
   })
 
   afterEach(() => {
+    for (const id of [THREAD, 'a', 'b', 'missing']) releaseRemovedThread(id)
     ;(window as any).go = previousGo
     kanban$.activeBoardId.set('')
     kanban$.paneThreadId.set('')

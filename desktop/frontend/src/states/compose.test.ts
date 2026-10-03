@@ -533,7 +533,8 @@ describe('quick reply draft sharing', () => {
             calls.push({ command, payload })
             if (command === 'mail.allocateIdentity') return { message_id: 'draft-core@example.com' }
             if (command === 'mail.folderList') return { folders: [] }
-            if (command === 'mail.threadList') return { threads: [] }
+            // Discarding a reply draft leaves the parent conversation in Inbox.
+            if (command === 'mail.threadList') return { threads: mail$.threads.get() }
             return {}
           },
         },

@@ -327,18 +327,21 @@ pub(crate) fn save_mobile_draft(data_dir: &str, params: &Value) -> Result<Value,
         // save look like it failed — the caller would drop the id it was
         // written under, leaving a copy nothing ever discards.
         let saved = json!({ "ok": true, "draft_id": draft_id, "saved_bytes": saved_bytes });
-        let batch = match crate::ffi::engine_block_on(crate::engine::fetch_recent_resilient(
-            &engine,
-            &account_id,
-            &drafts_folder,
-            DRAFT_SYNC_LIMIT,
-        )) {
-            Ok(batch) => batch,
-            Err(err) => {
-                eprintln!("meron-core: Drafts refresh for {account_id}: {err}");
-                return Ok(saved);
-            }
+        let refresh = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::refresh_written_folder(
+                    &engine,
+                    &account_id,
+                    &drafts_folder,
+                    DRAFT_SYNC_LIMIT,
+                )
+                .await,
+            )
+        })?;
+        let Some(refresh) = refresh else {
+            return Ok(saved);
         };
+        let batch = &refresh.batch;
         store::upsert_messages(&conn, &account_id, &drafts_folder, &batch.messages)
             .map_err(|err| err.to_string())?;
         let keep_uid = batch
@@ -1434,12 +1437,28 @@ pub(crate) fn copy_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
             })
         }))?;
         // Read-only refresh, on its own session; see the move handlers above.
-        let batch = crate::ffi::engine_block_on(crate::engine::fetch_recent_resilient(
-            &engine,
-            &target_account,
-            &target_folder,
-            50.max(copied as u32),
-        ))?;
+        let copied_result = json!({
+            "ok": true,
+            "copied": copied,
+            "source_folder": parsed.folder,
+            "target_account": target_account,
+            "target_folder": target_folder,
+        });
+        let refresh = crate::ffi::engine_block_on(async {
+            anyhow::Ok(
+                crate::engine::refresh_written_folder(
+                    &engine,
+                    &target_account,
+                    &target_folder,
+                    50.max(copied as u32),
+                )
+                .await,
+            )
+        })?;
+        let Some(refresh) = refresh else {
+            return Ok(copied_result);
+        };
+        let batch = &refresh.batch;
         store::ensure_folder(&conn, &target_account, &target_folder)
             .map_err(|err| err.to_string())?;
         store::upsert_messages(&conn, &target_account, &target_folder, &batch.messages)
@@ -1452,13 +1471,7 @@ pub(crate) fn copy_mobile_thread(data_dir: &str, params: &Value) -> Result<Value
             batch.uid_next,
         )
         .map_err(|err| err.to_string())?;
-        Ok(json!({
-            "ok": true,
-            "copied": copied,
-            "source_folder": parsed.folder,
-            "target_account": target_account,
-            "target_folder": target_folder,
-        }))
+        Ok(copied_result)
     })
 }
 

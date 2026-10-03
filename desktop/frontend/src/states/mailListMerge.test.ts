@@ -2,7 +2,8 @@ import { describe, expect, it } from 'bun:test'
 import type { Message } from '../types'
 import {
   THREAD_LIST_PAGE_SIZE,
-  dropLocallyRemovedThreads,
+  beginThreadListRead,
+  completeRemovedThread,
   mergeRefreshedThreadPage,
   nextSelectedAfterRefresh,
   releaseRemovedThread,
@@ -44,6 +45,18 @@ describe('mergeRefreshedThreadPage', () => {
     ])
   })
 
+  it('keeps a second-page row tied with the refreshed page boundary', () => {
+    const fetched = Array.from({ length: THREAD_LIST_PAGE_SIZE }, (_, index) => row(`t${index}`, 200 - index))
+    const boundary = row('page-two', fetched.at(-1)!.date)
+    expect(mergeRefreshedThreadPage([...fetched, boundary], fetched)).toEqual([...fetched, boundary])
+  })
+
+  it('keeps pinned rows that no longer match a filtered refresh', () => {
+    const read = row('read', 30)
+    const unread = row('unread', 20)
+    expect(mergeRefreshedThreadPage([read, unread], [unread], false, { read: true })).toEqual([read, unread])
+  })
+
   it('puts newly arrived mail first and leaves older mail behind it', () => {
     const previous = [row('old', 10)]
     const fetched = [row('new', 20), row('old', 10)]
@@ -60,9 +73,18 @@ describe('mergeRefreshedThreadPage', () => {
     ])
   })
 
-  it('keeps the list when the refresh comes back empty', () => {
-    const previous = [row('kept', 10)]
-    expect(mergeRefreshedThreadPage(previous, [])).toEqual(previous)
+  it('drops absent rows from a successful empty page with no cursor', () => {
+    expect(mergeRefreshedThreadPage([row('removed', 10)], [])).toEqual([])
+  })
+
+  it('preserves only triage pins in a successful empty page', () => {
+    const pinned = row('read', 20)
+    expect(mergeRefreshedThreadPage([pinned, row('removed', 10)], [], false, { read: true })).toEqual([pinned])
+  })
+
+  it('keeps loaded rows when an empty page still has a cursor', () => {
+    const previous = [row('older', 10)]
+    expect(mergeRefreshedThreadPage(previous, [], true)).toEqual(previous)
   })
 
   it('keeps scrolled threads when a short page still has more below', () => {
@@ -106,34 +128,41 @@ describe('nextSelectedAfterRefresh', () => {
   })
 })
 
-describe('dropLocallyRemovedThreads', () => {
-  it('keeps an archived thread out of a background refresh that still has the row', () => {
+describe('thread list removal guards', () => {
+  it('hides a removal from reads already in flight but allows later replies', () => {
     const archived = row('acc#INBOX#t.archived', 5)
     const neighbour = row('acc#INBOX#t.neighbour', 4)
-    const startedBefore = 0
-    const undo = suppressRemovedThread(archived.thread_id)
-    expect(
-      dropLocallyRemovedThreads([archived, neighbour], [archived], startedBefore, false).map((thread) => thread.thread_id),
-    ).toEqual([neighbour.thread_id])
-    expect(
-      dropLocallyRemovedThreads([archived, neighbour], [archived], Number.MAX_SAFE_INTEGER, false).map(
-        (thread) => thread.thread_id,
-      ),
-    ).toEqual([neighbour.thread_id])
-    undo()
-    expect(
-      dropLocallyRemovedThreads([archived, neighbour], [], startedBefore, false).map((thread) => thread.thread_id),
-    ).toEqual([archived.thread_id, neighbour.thread_id])
-    suppressRemovedThread(archived.thread_id)
-    expect(
-      dropLocallyRemovedThreads([archived, neighbour], [archived], Number.MAX_SAFE_INTEGER, true).map(
-        (thread) => thread.thread_id,
-      ),
-    ).toEqual([archived.thread_id, neighbour.thread_id])
-    suppressRemovedThread(archived.thread_id)
-    releaseRemovedThread(archived.thread_id)
-    expect(
-      dropLocallyRemovedThreads([archived, neighbour], [], startedBefore, false).map((thread) => thread.thread_id),
-    ).toEqual([archived.thread_id, neighbour.thread_id])
+    const before = beginThreadListRead()
+    const rollback = suppressRemovedThread(archived.thread_id)
+    const during = beginThreadListRead()
+    completeRemovedThread(archived.thread_id)
+    const after = beginThreadListRead()
+    try {
+      expect(before.filter([archived, neighbour])).toEqual([neighbour])
+      expect(during.filter([archived, neighbour])).toEqual([neighbour])
+      expect(after.filter([archived, neighbour])).toEqual([archived, neighbour])
+    } finally {
+      rollback()
+      before.dispose()
+      during.dispose()
+      after.dispose()
+    }
+  })
+
+  it('releases in-flight reads when the removal fails or is undone', () => {
+    const archived = row('acc#INBOX#t.archived', 5)
+    const rollback = suppressRemovedThread(archived.thread_id)
+    const read = beginThreadListRead()
+    try {
+      expect(read.filter([archived])).toEqual([])
+      rollback()
+      expect(read.filter([archived])).toEqual([archived])
+      suppressRemovedThread(archived.thread_id)
+      releaseRemovedThread(archived.thread_id)
+      expect(read.filter([archived])).toEqual([archived])
+    } finally {
+      releaseRemovedThread(archived.thread_id)
+      read.dispose()
+    }
   })
 })

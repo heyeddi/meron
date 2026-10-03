@@ -14,6 +14,7 @@ import {
   normalizeMessageId,
   reloadThreadCards,
   removeKanbanThread,
+  completeRemovedThread,
   releaseRemovedThread,
   suppressRemovedThread,
   requestThreadReselect,
@@ -114,6 +115,17 @@ function kanbanNeighbourThreadId(threadId: string): string {
   return threadsInPaneColumn().find((thread) => thread.thread_id !== threadId)?.thread_id ?? ''
 }
 
+function restoreRemovedThread(current: Message[], previous: Message[], threadId: string): Message[] {
+  const thread = previous.find((item) => item.thread_id === threadId)
+  if (!thread || current.some((item) => item.thread_id === threadId)) return current
+  const positions = new Map(previous.map((item, index) => [item.thread_id, index]))
+  return [...current, thread].sort(
+    (a, b) =>
+      b.date - a.date ||
+      (positions.get(a.thread_id) ?? previous.length) - (positions.get(b.thread_id) ?? previous.length),
+  )
+}
+
 function removeThreadLocally(threadId: string) {
   const previousThreads = mail$.threads.get()
   const previousMessages = mail$.messages.get()
@@ -164,16 +176,13 @@ function removeThreadLocally(threadId: string) {
   }
 
   return {
+    complete: () => completeRemovedThread(threadId),
     rollback: () => {
       unsuppress()
       // Put this thread back only. Restoring the whole list would resurrect
       // threads archived after this one started, which is what a fast burst
       // looks like when an earlier move fails.
-      const thread = previousThreads.find((item) => item.thread_id === threadId)
-      const currentThreads = mail$.threads.get()
-      if (thread && !currentThreads.some((item) => item.thread_id === threadId)) {
-        mail$.threads.set([...currentThreads, thread].sort((a, b) => b.date - a.date))
-      }
+      mail$.threads.set(restoreRemovedThread(mail$.threads.get(), previousThreads, threadId))
       const currentMessages = mail$.messages.get()
       const seenMessages = new Set(currentMessages.map((message) => message.id))
       const missingMessages = previousMessages.filter(
@@ -182,16 +191,7 @@ function removeThreadLocally(threadId: string) {
       if (missingMessages.length > 0) mail$.messages.set([...currentMessages, ...missingMessages])
       for (const [key, columnThreads] of previousKanbanThreads) {
         if (!columnThreads) continue
-        const card = columnThreads.find((item) => item.thread_id === threadId)
-        if (!card) continue
-        const column = kanban$.threads[key].get()
-        if (!column) {
-          kanban$.threads[key].set([card])
-          continue
-        }
-        if (!column.some((item) => item.thread_id === threadId)) {
-          kanban$.threads[key].set([...column, card])
-        }
+        kanban$.threads[key].set(restoreRemovedThread(kanban$.threads[key].get() ?? [], columnThreads, threadId))
       }
       // The reader may already have archived the neighbour. Only come back
       // here when the selection is still the one this removal chose.
@@ -253,7 +253,7 @@ export async function moveThreadToFolder(
   if (sourceFolder === targetFolderId) return
   const targetThreadId = threadIdInFolder(threadId, sourceThread?.account_id, targetFolderId)
 
-  const { rollback } = removeThreadLocally(threadId)
+  const { rollback, complete } = removeThreadLocally(threadId)
   try {
     const res = await invoke<MovedCopiesResult & MutationResult>('mail.move', {
       thread_id: threadId,
@@ -261,6 +261,7 @@ export async function moveThreadToFolder(
       ...(options.messageIds ? { message_ids: options.messageIds } : {}),
     })
     assertMoveAffected(res)
+    complete()
     applyMutationFolderUnreads(res)
     const copyIds = movedCopyIds(res)
     // The move already updated the cache. Reloading the first page in place
@@ -310,9 +311,11 @@ export async function bulkArchiveSelected(items: BulkSelectionItem[]) {
   try {
     for (const item of targets) {
       const sourceThread = findLocalThread(item.threadId)
-      rollbacks.push(removeThreadLocally(item.threadId).rollback)
+      const removal = removeThreadLocally(item.threadId)
+      rollbacks.push(removal.rollback)
       const res = await invoke('mail.archive', { thread_id: item.threadId })
       assertMoveAffected(res, 'Archive')
+      removal.complete()
       applyMutationFolderUnreads(res as MutationResult)
       if (sourceThread?.account_id) void refreshAccountFoldersCache(sourceThread.account_id, false)
     }
@@ -331,9 +334,11 @@ export async function bulkMoveSelectedToFolder(items: BulkSelectionItem[], targe
   const rollbacks: Array<() => void> = []
   try {
     for (const item of targets) {
-      rollbacks.push(removeThreadLocally(item.threadId).rollback)
+      const removal = removeThreadLocally(item.threadId)
+      rollbacks.push(removal.rollback)
       const res = await invoke('mail.move', { thread_id: item.threadId, target_folder_id: targetFolderId })
       assertMoveAffected(res)
+      removal.complete()
       applyMutationFolderUnreads(res as MutationResult)
     }
     await refreshThreadLocation(targets[0]?.accountId, false)
@@ -392,12 +397,14 @@ export async function bulkDeleteSelected(items: BulkSelectionItem[]) {
   const rollbacks: Array<() => void> = []
   try {
     for (const item of targets) {
-      rollbacks.push(removeThreadLocally(item.threadId).rollback)
+      const removal = removeThreadLocally(item.threadId)
+      rollbacks.push(removal.rollback)
       const res = await invoke('mail.delete', {
         thread_id: item.threadId,
         ...(item.folderId ? { folder: item.folderId } : {}),
       })
       assertDeleteAffected(res)
+      removal.complete()
       applyMutationFolderUnreads(res as MutationResult)
     }
     await refreshThreadLocation(undefined, false)
@@ -413,7 +420,7 @@ export async function archiveThread(threadId: string) {
   if (!threadId) return
   const sourceThread = findLocalThread(threadId)
   const sourceFolder = sourceThread?.folder_id ?? ''
-  const { rollback } = removeThreadLocally(threadId)
+  const { rollback, complete } = removeThreadLocally(threadId)
   try {
     const res = await invoke<{ folder?: string; thread_id?: string } & MovedCopiesResult & MutationResult>(
       'mail.archive',
@@ -422,6 +429,7 @@ export async function archiveThread(threadId: string) {
       },
     )
     assertMoveAffected(res, 'Archive')
+    complete()
     applyMutationFolderUnreads(res)
     const archivedThreadId = res.thread_id ?? threadIdInFolder(threadId, sourceThread?.account_id, res.folder)
     const copyIds = movedCopyIds(res)
@@ -473,7 +481,7 @@ export async function deleteThread(threadId: string, options: { permanent?: bool
     }
   }
 
-  const { rollback } = removeThreadLocally(threadId)
+  const { rollback, complete } = removeThreadLocally(threadId)
 
   try {
     const res = await invoke<
@@ -483,6 +491,7 @@ export async function deleteThread(threadId: string, options: { permanent?: bool
       ...(sourceFolder ? { folder: sourceFolder } : {}),
     })
     assertDeleteAffected(res)
+    complete()
     applyMutationFolderUnreads(res)
     const trashedThreadId = res.thread_id ?? threadIdInFolder(threadId, sourceThread?.account_id, res.trash)
     const copyIds = movedCopyIds(res)

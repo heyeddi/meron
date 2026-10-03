@@ -112,6 +112,7 @@ pub struct MovedCopies {
     /// `None` when the re-read failed; the move itself still stands.
     pub batch: Option<imap::RecentBatch>,
     pub uids: Vec<u32>,
+    _snapshot_guard: Option<MessageSyncGuard>,
 }
 
 impl MovedCopies {
@@ -231,6 +232,21 @@ pub async fn refresh_moved_copies(
     uid_next_before: Option<u32>,
     moved: Option<&[String]>,
 ) -> MovedCopies {
+    let guard = match MessageSyncGuard::begin(engine) {
+        Ok(guard) => guard,
+        Err(err) => {
+            crate::mlog!(
+                crate::log::Level::Warn,
+                "mail.sync",
+                "cannot guard moved-copy refresh: {err:#}"
+            );
+            return MovedCopies {
+                batch: None,
+                uids: Vec::new(),
+                _snapshot_guard: None,
+            };
+        }
+    };
     let batch = match fetch_recent_resilient(engine, account, target, 50.max(count as u32)).await {
         Ok(batch) => Some(batch),
         Err(err) => {
@@ -256,7 +272,11 @@ pub async fn refresh_moved_copies(
         },
         _ => Vec::new(),
     };
-    MovedCopies { batch, uids }
+    MovedCopies {
+        batch,
+        uids,
+        _snapshot_guard: Some(guard),
+    }
 }
 
 /// Every message in `target` at or above `floor`. Fails rather than return a
@@ -495,6 +515,75 @@ pub async fn sync_background_messages(
     sync_messages_with_policy(engine, account, folder, limit, true).await
 }
 
+/// A cache refresh after a successful server write. Keep the guard until the
+/// returned batch has been persisted, so cleanup cannot release stale UIDs.
+pub struct WrittenFolderRefresh {
+    pub batch: imap::RecentBatch,
+    _guard: MessageSyncGuard,
+}
+
+/// Cache warming must not turn a completed APPEND/save into a failed write.
+/// Registration and network failures skip the refresh; callers retain success.
+pub async fn refresh_written_folder(
+    engine: &Arc<Engine>,
+    account: &str,
+    folder: &str,
+    limit: u32,
+) -> Option<WrittenFolderRefresh> {
+    let result = async {
+        let guard = MessageSyncGuard::begin(engine)?;
+        let batch = fetch_recent_resilient(engine, account, folder, limit).await?;
+        anyhow::Ok(WrittenFolderRefresh {
+            batch,
+            _guard: guard,
+        })
+    }
+    .await;
+    match result {
+        Ok(refresh) => Some(refresh),
+        Err(err) => {
+            crate::mlog!(
+                crate::log::Level::Warn,
+                "mail.sync",
+                "account={account} folder={folder}: post-write refresh skipped: {err:#}"
+            );
+            None
+        }
+    }
+}
+
+// Keep registration alive through persistence, including when the caller drops
+// its future after spawn_blocking has started. Drop also covers network errors
+// and cancellation without leaving markers protected by a dead snapshot.
+pub struct MessageSyncGuard {
+    engine: Arc<Engine>,
+    id: i64,
+}
+
+impl MessageSyncGuard {
+    pub fn begin(engine: &Arc<Engine>) -> anyhow::Result<Self> {
+        let db = engine.db.lock().unwrap();
+        let (id, _) = store::begin_message_sync(&db)?;
+        Ok(Self {
+            engine: engine.clone(),
+            id,
+        })
+    }
+}
+
+impl Drop for MessageSyncGuard {
+    fn drop(&mut self) {
+        let db = self.engine.db.lock().unwrap();
+        if let Err(err) = store::end_message_sync(&db, self.id) {
+            crate::mlog!(
+                crate::log::Level::Warn,
+                "mail.sync",
+                "removal marker cleanup failed: {err:#}"
+            );
+        }
+    }
+}
+
 async fn sync_messages_with_policy(
     engine: &Arc<Engine>,
     account: &str,
@@ -509,25 +598,30 @@ async fn sync_messages_with_policy(
     let prepare_engine = engine.clone();
     let prepare_account = account.to_string();
     let prepare_folder = folder.to_string();
-    let (prior_modseq, prior_validity, removed_epoch) = tokio::task::spawn_blocking(move || {
-        let engine = prepare_engine;
-        let account = prepare_account.as_str();
-        let folder = prepare_folder.as_str();
-        let db = crate::log::timed_db_lock(&engine.db, "sync_messages.prepare/backfill");
-        if background && store::account_paused(&db, account)? {
-            return Err(anyhow::Error::new(BackgroundSyncCancelled));
-        }
-        let modseq = store::get_folder_modseq(&db, account, folder)?;
-        let validity = store::get_folder_state(&db, account, folder)?
-            .map(|(v, _)| v)
-            .unwrap_or(0);
-        // Removals after this point (an archive that lands while the fetch is
-        // still on the wire) get a higher epoch. This snapshot must not write
-        // those UIDs back.
-        let removed_epoch = store::removed_message_epoch(&db)?;
-        anyhow::Ok((modseq, validity, removed_epoch))
-    })
-    .await??;
+    let (prior_modseq, prior_validity, removed_epoch, removal_guard) =
+        tokio::task::spawn_blocking(move || {
+            let engine = prepare_engine;
+            let account = prepare_account.as_str();
+            let folder = prepare_folder.as_str();
+            let db = crate::log::timed_db_lock(&engine.db, "sync_messages.prepare/backfill");
+            if background && store::account_paused(&db, account)? {
+                return Err(anyhow::Error::new(BackgroundSyncCancelled));
+            }
+            let modseq = store::get_folder_modseq(&db, account, folder)?;
+            let validity = store::get_folder_state(&db, account, folder)?
+                .map(|(v, _)| v)
+                .unwrap_or(0);
+            // Removals after this point (an archive that lands while the fetch is
+            // still on the wire) get a higher epoch. This snapshot must not write
+            // those UIDs back.
+            let (id, removed_epoch) = store::begin_message_sync(&db)?;
+            let guard = MessageSyncGuard {
+                engine: engine.clone(),
+                id,
+            };
+            anyhow::Ok((modseq, validity, removed_epoch, guard))
+        })
+        .await??;
 
     let fetch = || async {
         let attempt = engine
@@ -602,6 +696,7 @@ async fn sync_messages_with_policy(
     let folder = folder.to_string();
     // Outside the network timeout: always observe the committed result.
     tokio::task::spawn_blocking(move || {
+    let _removal_guard = removal_guard;
     let account = account.as_str();
     let folder = folder.as_str();
     let db = crate::log::timed_db_lock(&engine.db, "sync_messages.persist");
@@ -772,4 +867,75 @@ pub async fn sync_companion_folders(
         });
     }
     outcomes
+}
+
+#[cfg(test)]
+mod removal_guard_tests {
+    use super::*;
+
+    struct TestHost;
+
+    impl EngineHost for TestHost {
+        fn open_db(&self) -> anyhow::Result<rusqlite::Connection> {
+            store::open_at(":memory:")
+        }
+        fn apply_secret(&self, _: &rusqlite::Connection, _: &str, _: &mut imap::Creds) {}
+        fn store_secret(
+            &self,
+            _: &rusqlite::Connection,
+            _: &str,
+            _: &crate::secrets::Secrets,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn post_write_refresh_skips_a_failed_guard_registration() {
+        let engine = Arc::new(Engine::new(Box::new(TestHost)).unwrap());
+        // Force the registration INSERT to fail before any network request.
+        engine
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TEMP TABLE active_message_syncs (invalid_column INTEGER);")
+            .unwrap();
+        assert!(
+            refresh_written_folder(&engine, "acct", "Drafts", 20)
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_snapshot_releases_its_removal_markers() {
+        let engine = Arc::new(Engine::new(Box::new(TestHost)).unwrap());
+        let worker_engine = engine.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = MessageSyncGuard::begin(&worker_engine).unwrap();
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        started.await.unwrap();
+        {
+            let db = engine.db.lock().unwrap();
+            store::delete_messages_by_uid(&db, "acct", "INBOX", &[7]).unwrap();
+            let count: i64 = db
+                .query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let db = engine.db.lock().unwrap();
+        let count: i64 = db
+            .query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 }

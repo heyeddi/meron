@@ -54,6 +54,8 @@ pub async fn fill_thread_gaps(
         return Ok(false);
     }
 
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
+
     // IMAP-read-only (SEARCH + FETCH); upserts are idempotent, so the whole loop
     // is safe to retry on a stale pooled connection. `remaining` is cloned per
     // invocation so a retry starts from the full gap set.
@@ -172,6 +174,7 @@ pub async fn read_cached_or_fetch(
         store::remote_image_policy(&db, account).unwrap_or_default()
     };
 
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     let mut message = engine
         .with_read_session(account, |session| {
             let account = account.to_string();

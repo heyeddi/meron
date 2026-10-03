@@ -13,7 +13,7 @@ use std::sync::Arc;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 
-use crate::engine::{Engine, attach_html};
+use crate::engine::{Engine, MessageSyncGuard, attach_html};
 use crate::reply::ReplyTarget;
 use crate::{imap, mail_model, parse, quote, reply, store};
 
@@ -354,6 +354,7 @@ async fn fetch_into_slots(
     indices: &[usize],
     media_root: &std::path::Path,
 ) -> anyhow::Result<()> {
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     let mut by_folder: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for &idx in indices {
         by_folder
@@ -428,8 +429,14 @@ fn spawn_fill_thread_bodies(
             by_folder.entry(folder).or_default().push(uid);
         }
         let mut fetched_any = false;
-        match fetch_thread_bodies(&engine, &account, &by_folder, media_root).await {
-            Ok(fetched) => {
+        let fetch = async {
+            let guard = MessageSyncGuard::begin(&engine)?;
+            let fetched = fetch_thread_bodies(&engine, &account, &by_folder, media_root).await?;
+            anyhow::Ok((guard, fetched))
+        }
+        .await;
+        match fetch {
+            Ok((_guard, fetched)) => {
                 let db = engine.db.lock().unwrap();
                 for (folder, uid, message) in fetched {
                     let _ = store::save_cached_message(&db, &account, &folder, uid, &message);
