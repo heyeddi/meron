@@ -705,14 +705,19 @@ async function loadThreadsWithRead(refresh: boolean, searchStage: ThreadSearchSt
     const fetchedCursor = mail$.threadsCursor.get()
     const fetchedHasMore = fetchedCursor !== ''
     const pinned = { ...(filter !== 'all' || attachments ? mail$.readThreads.get() : {}) }
+    // A background refresh of a search is answered from the local index, which
+    // lacks the hits only the server found. A row it does not return is "not
+    // found yet", not gone; keep the results and their pagination.
+    const searching = q.trim() !== ''
     for (const thread of previousThreads) {
-      if (failedAccountIds.has(thread.account_id)) pinned[thread.thread_id] = true
+      if (searching || failedAccountIds.has(thread.account_id)) pinned[thread.thread_id] = true
     }
     allThreads = mergeRefreshedThreadPage(previousThreads, fetchedThreads, fetchedHasMore, pinned)
     // Preserve loaded pagination depth when it has a cursor; an exhausted old
     // list must adopt the new page's cursor when more mail becomes available.
     // A partial failure cannot establish that the whole unified list is exhausted.
-    const exhausted = fetchedThreads.length < THREAD_LIST_PAGE_SIZE && !fetchedHasMore && failedAccountIds.size === 0
+    const exhausted =
+      !searching && fetchedThreads.length < THREAD_LIST_PAGE_SIZE && !fetchedHasMore && failedAccountIds.size === 0
     mail$.threadsCursor.set(exhausted ? '' : previousThreadsCursor || fetchedCursor)
     mail$.threadAccountCursors.set(exhausted || !previousThreadsCursor ? {} : previousAccountCursors)
   }
