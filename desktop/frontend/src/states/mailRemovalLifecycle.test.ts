@@ -62,6 +62,31 @@ it('clears the last removed rows and selection on a successful empty refresh', a
   expect(mail$.threadsCursor.get()).toBe('')
 })
 
+it('keeps live search results when a background refresh finds nothing in the cache', async () => {
+  setup(async () => ({ threads: [], next_cursor: '' }))
+  ui$.query.set('body only')
+  ui$.selectedThread.set(id)
+  mail$.threadLoading.set(false)
+  mail$.threadsCursor.set('old-cursor')
+  await loadThreads(false)
+  ui$.query.set('')
+  expect(mail$.threads.get()).toEqual([row()])
+  expect(ui$.selectedThread.get()).toBe(id)
+  expect(mail$.threadsCursor.get()).toBe('old-cursor')
+})
+
+it('keeps server-only search results when the cache returns some of the hits', async () => {
+  const cached = row('review#INBOX#t.Y2FjaGVk', 20)
+  setup(async () => ({ threads: [cached], next_cursor: '' }))
+  ui$.query.set('body only')
+  mail$.threads.set([row(), cached])
+  mail$.threadsCursor.set('old-cursor')
+  await loadThreads(false)
+  ui$.query.set('')
+  expect(mail$.threads.get()).toEqual([row(), cached])
+  expect(mail$.threadsCursor.get()).toBe('old-cursor')
+})
+
 it('preserves rows, selection and pagination when a background read fails', async () => {
   setup(async () => {
     throw new Error('Read failed')

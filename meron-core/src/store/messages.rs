@@ -749,21 +749,27 @@ pub fn release_removed_messages(
     Ok(())
 }
 
-/// Register a folder sync before network I/O. The temporary table belongs to
-/// this connection/process, so abandoned snapshots cannot survive a restart.
+/// Names this process in `active_message_syncs`. Rows carrying another name
+/// were left by a process that died mid-sync.
+fn message_sync_owner() -> &'static str {
+    static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OWNER.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
+/// Register a folder sync before network I/O. The registry is an ordinary
+/// table because engines in one process each hold their own connection (the
+/// mobile foreground engine and a transient background one), and a removal on
+/// one must stay hidden from a snapshot another is still fetching.
 /// Registration and cleanup run under the engine's database lock.
 pub fn begin_message_sync(conn: &Connection) -> Result<(i64, i64)> {
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS active_message_syncs (
-           id INTEGER PRIMARY KEY AUTOINCREMENT,
-           epoch INTEGER NOT NULL
-         );",
-    )?;
-    let tx = conn.unchecked_transaction()?;
+    // Take the write lock before reading the epoch. A deferred transaction that
+    // reads first fails with SQLITE_BUSY_SNAPSHOT when another connection
+    // commits in between, and the busy timeout cannot wait that out.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let epoch = removed_message_epoch(&tx)?;
     tx.execute(
-        "INSERT INTO active_message_syncs(epoch) VALUES(?1)",
-        params![epoch],
+        "INSERT INTO active_message_syncs(epoch, owner) VALUES(?1, ?2)",
+        params![epoch, message_sync_owner()],
     )?;
     let id = tx.last_insert_rowid();
     prune_removed_message_markers(&tx)?;
@@ -781,6 +787,11 @@ pub fn end_message_sync(conn: &Connection, id: i64) -> Result<()> {
 }
 
 fn prune_removed_message_markers(conn: &Connection) -> Result<()> {
+    // Abandoned snapshots must not survive a restart and pin markers forever.
+    conn.execute(
+        "DELETE FROM active_message_syncs WHERE owner != ?1",
+        params![message_sync_owner()],
+    )?;
     // A snapshot begun at E cannot contain a UID removed before or at E.
     // Keep all later removals until the oldest active snapshot has finished.
     conn.execute(

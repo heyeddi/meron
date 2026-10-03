@@ -1487,6 +1487,74 @@ fn removed_uid_markers_expire_after_the_oldest_sync_finishes() {
 }
 
 #[test]
+fn another_connection_cannot_prune_markers_an_active_sync_needs() {
+    let dir = std::env::temp_dir().join(format!("meron-store-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meron.db");
+    let syncing = db::open_at(&path).unwrap();
+    let archiving = db::open_at(&path).unwrap();
+    let count = || -> i64 {
+        syncing
+            .query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    };
+    let (stale, _) = begin_message_sync(&syncing).unwrap();
+    delete_messages_by_uid(&archiving, "acct", "INBOX", &[7]).unwrap();
+    let (other, _) = begin_message_sync(&archiving).unwrap();
+    end_message_sync(&archiving, other).unwrap();
+    assert_eq!(count(), 1, "the other connection's snapshot is still open");
+    end_message_sync(&syncing, stale).unwrap();
+    assert_eq!(count(), 0);
+
+    // A snapshot left behind by a dead process does not pin markers.
+    archiving
+        .execute(
+            "INSERT INTO active_message_syncs(epoch, owner) VALUES(0, 'dead')",
+            [],
+        )
+        .unwrap();
+    delete_messages_by_uid(&archiving, "acct", "INBOX", &[8]).unwrap();
+    let (id, _) = begin_message_sync(&syncing).unwrap();
+    assert_eq!(count(), 0);
+    end_message_sync(&syncing, id).unwrap();
+
+    drop(syncing);
+    drop(archiving);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn concurrent_sync_registration_waits_instead_of_failing() {
+    let dir = std::env::temp_dir().join(format!("meron-store-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("meron.db");
+    db::open_at(&path).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+    let handles = (0..4u32)
+        .map(|worker| {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let conn = db::open_at(&path).unwrap();
+                barrier.wait();
+                for round in 0..50 {
+                    let (id, _) = begin_message_sync(&conn).unwrap();
+                    delete_messages_by_uid(&conn, "acct", "INBOX", &[worker * 100 + round + 1])
+                        .unwrap();
+                    end_message_sync(&conn, id).unwrap();
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn a_new_sync_purges_removal_markers_left_without_active_snapshots() {
     let conn = test_conn();
     delete_messages_by_uid(&conn, "acct", "INBOX", &[7, 8, 9]).unwrap();
@@ -2535,7 +2603,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     for table in [
         "accounts",
@@ -2554,6 +2622,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
         "task_lists",
         "tasks",
         "removed_message_uids",
+        "active_message_syncs",
     ] {
         let exists = conn
             .query_row(
@@ -2572,7 +2641,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 }
 
 #[test]
@@ -2600,7 +2669,7 @@ fn concurrent_first_open_runs_migrations_once() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -4289,7 +4358,7 @@ fn tasks_tables_arrive_on_an_existing_install() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, 15);
 
     // Cached mail is untouched, and the new tables are writable.
     let messages: i64 = conn

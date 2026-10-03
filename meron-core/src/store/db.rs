@@ -537,6 +537,9 @@ pub(super) fn run_migrations(conn: &Connection) -> Result<()> {
     if version < 14 {
         migrate_v14(&tx)?;
     }
+    if version < 15 {
+        migrate_v15(&tx)?;
+    }
 
     tx.commit()?;
     Ok(())
@@ -806,6 +809,20 @@ fn migrate_v14(conn: &Connection) -> Result<()> {
          ) WITHOUT ROWID;",
     )?;
     conn.execute_batch("PRAGMA user_version = 14;")?;
+    Ok(())
+}
+
+/// Folder syncs with a snapshot in flight, shared by every connection so one
+/// engine does not prune removal markers another engine's sync still needs.
+fn migrate_v15(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS active_message_syncs (
+           id    INTEGER PRIMARY KEY AUTOINCREMENT,
+           epoch INTEGER NOT NULL,
+           owner TEXT NOT NULL
+         );",
+    )?;
+    conn.execute_batch("PRAGMA user_version = 15;")?;
     Ok(())
 }
 
