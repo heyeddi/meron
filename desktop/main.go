@@ -44,7 +44,7 @@ func main() {
 	installWindowChrome(integrated)
 
 	err := wails.Run(&options.App{
-		Title:                    "Meron",
+		Title:                    appTitle(),
 		Width:                    app.window.Width,
 		Height:                   app.window.Height,
 		WindowStartState:         startWindowState(startMaximised),

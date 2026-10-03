@@ -2,7 +2,8 @@ import { beforeEach, describe, expect, it } from 'bun:test'
 import { accounts$ } from '../states/accounts'
 import { t } from './i18n'
 import { kanban$, setGlobalKanbanAttachmentsOnly, setGlobalKanbanFilter } from '../states/kanban'
-import { mail$ } from '../states/mail'
+import { mail$, releaseRemovedThread, suppressRemovedThread } from '../states/mail'
+import { ui$ } from '../states/ui'
 import { settings$ } from '../states/settings'
 import type { Account, Folder } from '../types'
 import {
@@ -604,6 +605,46 @@ describe('kanban column loading filters', () => {
     await loadKanbanColumn({ accountId: 'acc1', folderId: 'INBOX' }, false)
 
     expect(kanban$.threads['acc1\nINBOX'].get().map((thread) => thread.thread_id)).toEqual(['t2', 't1'])
+  })
+
+  it('keeps an archived card out of a column reload and follows the open card', async () => {
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: async () => ({
+            threads: [
+              message({ id: 't1', thread_id: 't1', date: 200 }),
+              message({ id: 't2', thread_id: 't2', date: 100 }),
+            ],
+            next_cursor: '',
+          }),
+        },
+      },
+    }
+    const column = { accountId: 'acc1', folderId: 'INBOX' }
+    kanban$.activeBoardId.set('board')
+    kanban$.paneColumnKey.set('board\nacc1\nINBOX')
+    kanban$.paneThreadId.set('t1')
+    ui$.selectedThread.set('t1')
+    kanban$.threads['acc1\nINBOX'].set([
+      message({ id: 't1', thread_id: 't1', date: 200 }),
+      message({ id: 't2', thread_id: 't2', date: 100 }),
+    ])
+    await loadKanbanColumn(column, false)
+    const undo = suppressRemovedThread('t1')
+    try {
+      await loadKanbanColumn(column, false)
+      expect(kanban$.threads['acc1\nINBOX'].get().map((thread) => thread.thread_id)).toEqual(['t2'])
+      expect(kanban$.paneThreadId.get()).toBe('t2')
+      expect(ui$.selectedThread.get()).toBe('t2')
+    } finally {
+      undo()
+      releaseRemovedThread('t1')
+      kanban$.activeBoardId.set('')
+      kanban$.paneThreadId.set('')
+      kanban$.paneColumnKey.set('')
+      ui$.selectedThread.set('')
+    }
   })
 
   it('does not resurrect read threads when the column filter is All', async () => {

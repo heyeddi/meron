@@ -19,10 +19,16 @@ pub fn upsert_messages(
     messages: &[MessageHeader],
 ) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    let removed = removed_uids_in(&tx, account, folder)?;
     // The Message-IDs this batch cached: the only ids whose arrival can hand a
     // canonical thread key down to rows already in the cache.
     let mut upserted_ids: HashSet<String> = HashSet::new();
     for m in messages {
+        // A move or delete already dropped this UID. A sync that fetched it
+        // beforehand must not put the row back into the folder it left.
+        if removed.contains(&m.uid) {
+            continue;
+        }
         // Store recipient lists as JSON. Skip empty lists so a later flag-only
         // resync (which carries no envelope) can't clobber recipients we already
         // cached with NULLs.
@@ -694,16 +700,87 @@ pub fn prune_missing_messages(
     drop(stmt);
 
     let mut removed = 0usize;
+    let mut gone = Vec::new();
     for uid in local_uids {
         if !server_uids.contains(&uid) {
             conn.execute(
                 "DELETE FROM messages WHERE account = ?1 AND folder = ?2 AND uid = ?3",
                 params![account, folder, uid],
             )?;
+            gone.push(uid);
             removed += 1;
         }
     }
+    remember_removed_uids(conn, account, folder, &gone)?;
     Ok(removed)
+}
+
+/// Epoch of the latest UID removal. A folder sync reads this before it talks
+/// to the server; removals that happen while that fetch is in flight get a
+/// higher epoch and stay hidden from that snapshot.
+pub fn removed_message_epoch(conn: &Connection) -> Result<i64> {
+    Ok(conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'removed_uid_epoch'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0))
+}
+
+/// Forget removals at or before `fetched_at_epoch` for these UIDs. The sync
+/// that passes the epoch it read before fetching may store a UID only when
+/// nothing removed it afterwards — the snapshot and the removal agree.
+pub fn release_removed_messages(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    uids: &[u32],
+    fetched_at_epoch: i64,
+) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "DELETE FROM removed_message_uids
+         WHERE account = ?1 AND folder = ?2 AND uid = ?3 AND epoch <= ?4",
+    )?;
+    for uid in uids {
+        stmt.execute(params![account, folder, *uid, fetched_at_epoch])?;
+    }
+    Ok(())
+}
+
+fn removed_uids_in(conn: &Connection, account: &str, folder: &str) -> Result<HashSet<u32>> {
+    let mut stmt =
+        conn.prepare("SELECT uid FROM removed_message_uids WHERE account = ?1 AND folder = ?2")?;
+    let rows = stmt.query_map(params![account, folder], |row| row.get(0))?;
+    Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
+}
+
+pub(crate) fn remember_removed_uids(
+    conn: &Connection,
+    account: &str,
+    folder: &str,
+    uids: &[u32],
+) -> Result<()> {
+    let uids: Vec<u32> = uids.iter().copied().filter(|uid| *uid != 0).collect();
+    if uids.is_empty() {
+        return Ok(());
+    }
+    let epoch = removed_message_epoch(conn)? + 1;
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES('removed_uid_epoch', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![epoch.to_string()],
+    )?;
+    let mut stmt = conn.prepare(
+        "INSERT INTO removed_message_uids(account, folder, uid, epoch)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(account, folder, uid) DO UPDATE SET epoch = excluded.epoch",
+    )?;
+    for uid in uids {
+        stmt.execute(params![account, folder, uid, epoch])?;
+    }
+    Ok(())
 }
 
 pub fn clear_folder_messages(conn: &Connection, account: &str, folder: &str) -> Result<()> {
@@ -713,6 +790,12 @@ pub fn clear_folder_messages(conn: &Connection, account: &str, folder: &str) -> 
     )?;
     conn.execute(
         "DELETE FROM uncached_unseen WHERE account = ?1 AND folder = ?2",
+        params![account, folder],
+    )?;
+    // UIDVALIDITY changed: these UID numbers no longer name the messages that
+    // were removed, so they must not block the folder's new contents.
+    conn.execute(
+        "DELETE FROM removed_message_uids WHERE account = ?1 AND folder = ?2",
         params![account, folder],
     )?;
     Ok(())

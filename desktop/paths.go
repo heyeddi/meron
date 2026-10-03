@@ -161,6 +161,13 @@ func appDirName() string {
 	return "meron"
 }
 
+func appTitle() string {
+	if isWailsDevLaunch() {
+		return "Meron-dev"
+	}
+	return "Meron"
+}
+
 func appUniqueID() string {
 	if isWailsDevLaunch() {
 		return "jp.nonbili.meron-dev"

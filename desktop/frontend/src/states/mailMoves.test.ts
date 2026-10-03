@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import type { Message } from '../types'
 import './accounts'
+import { kanban$ } from './kanban'
 import { mail$ } from './mail'
 import { markUnreadWithUndo } from './mailFlags'
 import { archiveThread, deleteThread, moveThreadToFolder } from './mailMoves'
@@ -65,6 +66,10 @@ describe('undo after moving a thread', () => {
 
   afterEach(() => {
     ;(window as any).go = previousGo
+    kanban$.activeBoardId.set('')
+    kanban$.paneThreadId.set('')
+    kanban$.paneColumnKey.set('')
+    kanban$.threads.set({})
   })
 
   async function runUndo() {
@@ -126,6 +131,79 @@ describe('undo after moving a thread', () => {
       target_folder_id: 'INBOX',
       message_ids: ['5'],
     })
+  })
+
+  it('keeps later archives when an earlier one fails', async () => {
+    const older = thread({ id: 'c', thread_id: 'c', date: 10 })
+    const middle = thread({ id: 'b', thread_id: 'b', date: 20 })
+    const newest = thread({ id: 'a', thread_id: 'a', date: 30 })
+    mail$.threads.set([newest, middle, older])
+    ui$.selectedThread.set('a')
+    let rejectFirst: (error: Error) => void = () => {}
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: (command: string, payload: { thread_id?: string }) => {
+            if (command === 'mail.archive' && payload.thread_id === 'a') {
+              return new Promise((_resolve, reject) => {
+                rejectFirst = reject
+              })
+            }
+            return new Promise(() => {})
+          },
+        },
+      },
+    }
+
+    const first = archiveThread('a')
+    void archiveThread('b')
+    await Promise.resolve()
+    expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['c'])
+    expect(ui$.selectedThread.get()).toBe('c')
+
+    rejectFirst(new Error('archive failed'))
+    await first
+    expect(mail$.threads.get().map((item) => item.thread_id)).toEqual(['a', 'c'])
+    expect(ui$.selectedThread.get()).toBe('c')
+  })
+
+  it('stays on a card when the archived thread is already off the board', async () => {
+    const next = thread({ id: 'b', thread_id: 'b', date: 20, account_id: 'acc', folder_id: 'INBOX' })
+    kanban$.activeBoardId.set('board')
+    kanban$.paneColumnKey.set('board\nacc\nINBOX')
+    kanban$.paneThreadId.set('missing')
+    kanban$.threads['acc\nINBOX'].set([next, thread({ id: 'c', thread_id: 'c', date: 10 })])
+    ui$.selectedThread.set('missing')
+    mail$.threads.set([])
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: () => new Promise(() => {}),
+        },
+      },
+    }
+
+    void archiveThread('missing')
+    await Promise.resolve()
+    expect(ui$.selectedThread.get()).toBe('b')
+    expect(kanban$.paneThreadId.get()).toBe('b')
+  })
+
+  it('stays on a visible row when the archived thread is already off the list', async () => {
+    const next = thread({ id: 'b', thread_id: 'b', date: 20 })
+    mail$.threads.set([next, thread({ id: 'c', thread_id: 'c', date: 10 })])
+    ui$.selectedThread.set('missing')
+    ;(window as any).go = {
+      main: {
+        App: {
+          Invoke: () => new Promise(() => {}),
+        },
+      },
+    }
+
+    void archiveThread('missing')
+    await Promise.resolve()
+    expect(ui$.selectedThread.get()).toBe('b')
   })
 
   it('offers undo for mark unread only once it has landed', async () => {

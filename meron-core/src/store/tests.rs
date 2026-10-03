@@ -1372,6 +1372,33 @@ fn cached_body_preview_collapses_body_and_misses_without_a_cached_body() {
 }
 
 #[test]
+fn a_sync_snapshot_from_before_a_move_cannot_put_the_message_back() {
+    let conn = test_conn();
+    let message = MessageHeader {
+        uid: 7,
+        subject: "Archive me".into(),
+        from_addr: "a@example.com".into(),
+        thread_key: "topic".into(),
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "INBOX", &[message.clone()]).unwrap();
+    // What a folder sync reads before it goes to the network.
+    let fetched_at = removed_message_epoch(&conn).unwrap();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+
+    // The snapshot still contains the message, and it started before the move.
+    release_removed_messages(&conn, "acct", "INBOX", &[7], fetched_at).unwrap();
+    upsert_messages(&conn, "acct", "INBOX", &[message.clone()]).unwrap();
+    assert!(!has_message(&conn, "acct", "INBOX", 7).unwrap());
+
+    // A later sync really does see the UID in the folder again (moved back).
+    let later = removed_message_epoch(&conn).unwrap();
+    release_removed_messages(&conn, "acct", "INBOX", &[7], later).unwrap();
+    upsert_messages(&conn, "acct", "INBOX", &[message]).unwrap();
+    assert!(has_message(&conn, "acct", "INBOX", 7).unwrap());
+}
+
+#[test]
 fn cached_archive_identity_suppresses_inbox_arrival_and_survives_deletion() {
     let conn = test_conn();
     let mut message = MessageHeader {
@@ -2405,7 +2432,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 
     for table in [
         "accounts",
@@ -2423,6 +2450,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
         "observed_mail_identities",
         "task_lists",
         "tasks",
+        "removed_message_uids",
     ] {
         let exists = conn
             .query_row(
@@ -2441,7 +2469,7 @@ fn run_migrations_creates_schema_and_bumps_version() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -2469,7 +2497,7 @@ fn concurrent_first_open_runs_migrations_once() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -4158,7 +4186,7 @@ fn tasks_tables_arrive_on_an_existing_install() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 
     // Cached mail is untouched, and the new tables are writable.
     let messages: i64 = conn

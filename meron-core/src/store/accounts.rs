@@ -764,6 +764,10 @@ pub fn delete_account(conn: &Connection, id: &str) -> Result<()> {
         "DELETE FROM uncached_unseen WHERE account = ?1",
         params![id],
     )?;
+    tx.execute(
+        "DELETE FROM removed_message_uids WHERE account = ?1",
+        params![id],
+    )?;
     tx.execute("DELETE FROM subscriptions WHERE account = ?1", params![id])?;
     tx.execute(
         "DELETE FROM observed_mail_identities WHERE account = ?1",
