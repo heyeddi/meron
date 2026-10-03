@@ -10,7 +10,7 @@ import {
   kanban$,
   type KanbanColumn,
 } from '../states/kanban'
-import { mail$, nextSelectedAfterRefresh, omitLocallyRemovedThreads } from '../states/mail'
+import { beginThreadListRead, mail$, nextSelectedAfterRefresh } from '../states/mail'
 import { updateCachedFolderUnread } from '../states/mailFolders'
 import { showToast, ui$ } from '../states/ui'
 import type { FilterMode } from '../states/ui'
@@ -607,8 +607,15 @@ function followOpenKanbanCard(column: KanbanColumn, previous: Message[], visible
   if (ui$.selectedThread.peek() === paneId) ui$.selectedThread.set(next)
 }
 
-function showColumnThreads(column: KanbanColumn, key: string, threads: Message[], previous: Message[], refresh: boolean) {
-  const visible = omitLocallyRemovedThreads(threads)
+function showColumnThreads(
+  column: KanbanColumn,
+  key: string,
+  threads: Message[],
+  previous: Message[],
+  refresh: boolean,
+  read: ReturnType<typeof beginThreadListRead>,
+) {
+  const visible = read.filter(threads)
   followOpenKanbanCard(column, previous, visible, refresh)
   kanban$.threads[key].set(visible)
 }
@@ -628,6 +635,7 @@ export async function loadKanbanColumn(column: KanbanColumn, refresh = false, qu
   const limit = Math.min(Math.max(COLUMN_LIMIT, depth), COLUMN_MAX_RELOAD_DEPTH)
   const shown = sameView ? (kanban$.threads[key].peek() ?? []) : []
   const oldestShown = oldestThreadDate(shown)
+  const read = beginThreadListRead()
   kanban$.loading[key].set(true)
   try {
     const page = await fetchColumnThreads(column, refresh, view, undefined, limit)
@@ -667,7 +675,7 @@ export async function loadKanbanColumn(column: KanbanColumn, refresh = false, qu
         updateCachedFolderUnread(accountId, unreadCacheFolder, unread)
       }
     }
-    showColumnThreads(column, key, keepReadThreads(column, key, threads), shown, refresh)
+    showColumnThreads(column, key, keepReadThreads(column, key, threads), shown, refresh, read)
     if (folderUnread !== undefined) kanban$.unreadCounts[key].set(folderUnread)
     kanban$.cursors[key].set(nextSingle)
     kanban$.accountCursors[key].set(nextUnified)
@@ -690,12 +698,13 @@ export async function loadKanbanColumn(column: KanbanColumn, refresh = false, qu
       if (columnLoadVersions.get(key) !== version) return
       const synced = await fetchColumnThreads(column, false, view, undefined, limit)
       if (columnLoadVersions.get(key) !== version) return
-      showColumnThreads(column, key, keepReadThreads(column, key, synced.threads), shown, refresh)
+      showColumnThreads(column, key, keepReadThreads(column, key, synced.threads), shown, refresh, read)
       if (synced.folderUnread !== undefined) kanban$.unreadCounts[key].set(synced.folderUnread)
       kanban$.cursors[key].set(synced.nextSingle)
       kanban$.accountCursors[key].set(synced.nextUnified)
     }
   } finally {
+    read.dispose()
     if (columnLoadVersions.get(key) === version) {
       kanban$.loading[key].set(false)
     }
@@ -771,6 +780,7 @@ export async function loadMoreKanbanColumn(column: KanbanColumn) {
   if (kanban$.loadingMore[key].get() || kanban$.loading[key].peek() || !columnHasMore(key, unified)) return
   const version = columnLoadVersions.get(key) ?? 0
   const view = columnCursorViews.get(key) ?? currentColumnView(column, activeKanbanColumnQuery(column))
+  const read = beginThreadListRead()
   kanban$.loadingMore[key].set(true)
   try {
     const { threads, folderUnreadByAccount, nextSingle, nextUnified } = await fetchColumnThreads(column, false, view, {
@@ -782,10 +792,7 @@ export async function loadMoreKanbanColumn(column: KanbanColumn) {
     if ((columnLoadVersions.get(key) ?? 0) !== version) return
     const existing = kanban$.threads[key].get() ?? []
     const seen = new Set(existing.map((thread) => thread.thread_id))
-    const merged = omitLocallyRemovedThreads([
-      ...existing,
-      ...threads.filter((thread) => !seen.has(thread.thread_id)),
-    ])
+    const merged = read.filter([...existing, ...threads.filter((thread) => !seen.has(thread.thread_id))])
     // As in loadKanbanColumn: only Inbox totals belong in the badge cache.
     const unreadCacheFolder = unified
       ? unifiedFolderRole(column.folderId) === 'inbox'
@@ -804,6 +811,7 @@ export async function loadMoreKanbanColumn(column: KanbanColumn) {
     kanban$.cursors[key].set(nextSingle)
     kanban$.accountCursors[key].set(nextUnified)
   } finally {
+    read.dispose()
     kanban$.loadingMore[key].set(false)
   }
 }

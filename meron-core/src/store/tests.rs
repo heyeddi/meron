@@ -261,6 +261,28 @@ fn folder_unread_includes_unseen_server_mail_outside_the_cache() {
 }
 
 #[test]
+fn a_stale_unseen_snapshot_cannot_restore_an_archived_uid_to_unread_counts() {
+    let conn = test_conn();
+    insert_message(&conn, 7, "Archive me", "Ada", "ada@example.com", None);
+    let (sync, fetched_at) = begin_message_sync(&conn).unwrap();
+    let stale_unseen = [3, 7].into_iter().collect();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+    release_removed_messages(&conn, "acct", "INBOX", &[7], fetched_at).unwrap();
+    set_uncached_unseen(&conn, "acct", "INBOX", &stale_unseen).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 1);
+    assert_eq!(get_unseen_uids(&conn, "acct", "INBOX").unwrap(), vec![3]);
+    // Removal markers are scoped to their source mailbox and account.
+    set_uncached_unseen(&conn, "acct", "Archive", &stale_unseen).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "Archive").unwrap(), 2);
+    set_uncached_unseen(&conn, "other", "INBOX", &stale_unseen).unwrap();
+    assert_eq!(get_folder_unread(&conn, "other", "INBOX").unwrap(), 2);
+    end_message_sync(&conn, sync).unwrap();
+    // A later valid unseen read still counts ordinary uncached mail.
+    set_uncached_unseen(&conn, "acct", "INBOX", &[3, 8].into_iter().collect()).unwrap();
+    assert_eq!(get_folder_unread(&conn, "acct", "INBOX").unwrap(), 2);
+}
+
+#[test]
 fn removing_a_paged_in_message_does_not_revive_its_uncached_unread() {
     let conn = test_conn();
     set_uncached_unseen(&conn, "acct", "INBOX", &[4].into_iter().collect()).unwrap();
@@ -1396,6 +1418,87 @@ fn a_sync_snapshot_from_before_a_move_cannot_put_the_message_back() {
     release_removed_messages(&conn, "acct", "INBOX", &[7], later).unwrap();
     upsert_messages(&conn, "acct", "INBOX", &[message]).unwrap();
     assert!(has_message(&conn, "acct", "INBOX", 7).unwrap());
+}
+
+#[test]
+fn a_late_body_fetch_cannot_reinsert_a_removed_message() {
+    let conn = test_conn();
+    let header = MessageHeader {
+        uid: 7,
+        subject: "Archive me".into(),
+        ..Default::default()
+    };
+    let body = Message {
+        subject: "Archive me".into(),
+        body: "Late body".into(),
+        ..Default::default()
+    };
+    upsert_messages(&conn, "acct", "INBOX", &[header.clone()]).unwrap();
+    let (body_fetch, _) = begin_message_sync(&conn).unwrap();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+    // An unrelated fresh sync must not clean up the marker while the body fetch
+    // still owns an older snapshot.
+    let (other_sync, _) = begin_message_sync(&conn).unwrap();
+    end_message_sync(&conn, other_sync).unwrap();
+    // fill_thread_gaps writes the header and the body in succession.
+    upsert_messages(&conn, "acct", "INBOX", &[header.clone()]).unwrap();
+    save_cached_message(&conn, "acct", "INBOX", 7, &body).unwrap();
+    assert!(!has_message(&conn, "acct", "INBOX", 7).unwrap());
+    assert!(
+        get_cached_message(&conn, "acct", "INBOX", 7)
+            .unwrap()
+            .is_none()
+    );
+    end_message_sync(&conn, body_fetch).unwrap();
+    // A later valid fetch can still cache a body normally.
+    upsert_messages(&conn, "acct", "INBOX", &[header]).unwrap();
+    save_cached_message(&conn, "acct", "INBOX", 7, &body).unwrap();
+    assert_eq!(
+        get_cached_message(&conn, "acct", "INBOX", 7)
+            .unwrap()
+            .unwrap()
+            .body,
+        "Late body"
+    );
+}
+
+#[test]
+fn removed_uid_markers_expire_after_the_oldest_sync_finishes() {
+    let conn = test_conn();
+    let count = || -> i64 {
+        conn.query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    let (first, _) = begin_message_sync(&conn).unwrap();
+    let (same_epoch, _) = begin_message_sync(&conn).unwrap();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7]).unwrap();
+    let (later, _) = begin_message_sync(&conn).unwrap();
+    assert_eq!(count(), 1);
+    end_message_sync(&conn, first).unwrap();
+    assert_eq!(count(), 1, "another old snapshot still needs the marker");
+    end_message_sync(&conn, same_epoch).unwrap();
+    assert_eq!(count(), 0, "the newer sync cannot contain the old UID");
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[8]).unwrap();
+    assert_eq!(count(), 1);
+    end_message_sync(&conn, later).unwrap();
+    assert_eq!(count(), 0, "no active snapshots remain");
+}
+
+#[test]
+fn a_new_sync_purges_removal_markers_left_without_active_snapshots() {
+    let conn = test_conn();
+    delete_messages_by_uid(&conn, "acct", "INBOX", &[7, 8, 9]).unwrap();
+    let (id, epoch) = begin_message_sync(&conn).unwrap();
+    assert!(epoch > 0);
+    let count: i64 = conn
+        .query_row("SELECT count(*) FROM removed_message_uids", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+    end_message_sync(&conn, id).unwrap();
 }
 
 #[test]

@@ -322,6 +322,7 @@ async fn append_search_batch(
     token: &str,
     incomplete: &mut bool,
 ) -> anyhow::Result<bool> {
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     let (batch, next) =
         store::take_search_pending(&engine.db.lock().unwrap(), token, LIVE_SEARCH_BATCH)?;
     let mut requests: Vec<(String, Vec<u32>)> = Vec::new();
@@ -747,6 +748,7 @@ pub async fn search_starred_mail_messages(
     }
 
     if refresh {
+        let _snapshot_guard = MessageSyncGuard::begin(engine)?;
         // Best-effort per folder: a single folder's failure is logged and
         // skipped, so the closure always succeeds (no stale-retry needed here).
         let fetch_cap = (limit as usize).max(LIVE_SEARCH_BATCH);

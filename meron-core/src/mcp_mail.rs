@@ -234,7 +234,7 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
     }
     // Refresh the move destination on a read session. The write is never retried.
     let refresh_folder = target.as_deref().unwrap_or(&input.folder);
-    let refresh = crate::engine::fetch_recent_resilient(
+    let refresh = crate::engine::refresh_written_folder(
         engine,
         &account,
         refresh_folder,
@@ -246,8 +246,9 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
         store::delete_messages_by_uid(&db, &account, &input.folder, &input.uids)?;
         store::ensure_folder(&db, &account, target)?;
     }
-    let warning = match refresh {
-        Ok(batch) => {
+    let warning = match refresh.as_ref() {
+        Some(refresh) => {
+            let batch = &refresh.batch;
             store::upsert_messages(&db, &account, refresh_folder, &batch.messages)?;
             store::set_folder_state(
                 &db,
@@ -258,7 +259,7 @@ pub async fn organize(engine: &Arc<Engine>, value: Value) -> Result<Value> {
             )?;
             None
         }
-        Err(_) => {
+        None => {
             Some("The operation completed but the mailbox refresh failed. Do not retry the write.")
         }
     };

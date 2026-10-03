@@ -502,14 +502,24 @@ pub(crate) async fn dispatch(
                 })
                 .await?;
             // Read-only refresh, on its own session; see the move handler above.
-            let target_batch = fetch_recent_resilient(
+            let copied_result = json!({
+                "ok": true,
+                "copied": copied,
+                "source_folder": folder,
+                "target_account": target_account,
+                "target_folder": target_folder
+            });
+            let Some(refresh) = meron_core::engine::refresh_written_folder(
                 engine,
                 &target_account,
                 &target_folder,
                 50.max(raw_messages.len() as u32),
             )
             .await
-            .context("refresh target folder after copy")?;
+            else {
+                return Ok(copied_result);
+            };
+            let target_batch = &refresh.batch;
 
             {
                 let db = engine.db.lock().unwrap();
@@ -529,13 +539,7 @@ pub(crate) async fn dispatch(
                 )?;
             }
 
-            Ok(json!({
-                "ok": true,
-                "copied": copied,
-                "source_folder": folder,
-                "target_account": target_account,
-                "target_folder": target_folder
-            }))
+            Ok(copied_result)
         }
 
         // Mark every message in a folder as read: set \Seen on the server for the
