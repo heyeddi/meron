@@ -282,7 +282,7 @@ describe('Composer', () => {
       updateComposeDraft(tabId, { fromEmail: 'a@example.com' })
     })
     await act(async () => {
-      view.getByTitle('Close tab').click()
+      view.getByTitle('Hello').querySelector('button')!.click()
       expect(draftOf(tabId)).toBeUndefined()
       holdAllocation?.()
       holdAllocation = null
@@ -309,7 +309,7 @@ describe('Composer', () => {
       updateComposeDraft(tabId, { fromEmail: 'a@example.com' })
     })
     await act(async () => {
-      view.getByTitle('Close tab').click()
+      view.getByTitle('Hello').querySelector('button')!.click()
       holdAllocation?.()
       holdAllocation = null
       await new Promise((resolve) => setTimeout(resolve, 50))

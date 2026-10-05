@@ -4,10 +4,10 @@ import { useTranslation } from '../../lib/i18n'
 import { copyText } from '../../lib/native'
 import { Gallery, type GalleryItem } from './Gallery'
 import { HtmlFrame } from './HtmlFrame'
-import { FRAME_GENERATION_MARKER, applyBubbleTheme, prepareBubbleHtml } from './bubbleHtml'
+import { FRAME_GENERATION_MARKER, applyBubbleTheme, prepareBubbleHtml, reserveImageBoxes } from './bubbleHtml'
 import { bodyContentKey } from './messageHelpers'
 import { applyFrameHighlights, clearFrameHighlights } from './frameSearchHighlight'
-import { frameMetrics, measureFrameHeight } from './frameHeight'
+import { MIN_FRAME_HEIGHT, frameMetrics, measureFrameHeight } from './frameHeight'
 import { useMessageFrameFont } from './useMessageFrameFont'
 import { installFrameQuoteFold, isInFoldedQuote } from './quoteFold'
 import { useBubbleTheme } from './useFrameTheme'
@@ -146,13 +146,23 @@ export function BubbleHtmlFrame({
   // Only a new document starts over from the placeholder height. A theme change
   // keeps the height it has — the frame is still showing a measured document —
   // and the resize observer files the new one if the canvas changes its box.
+  // A measurement can land in the same turn the iframe loads, before this
+  // effect; replacing that with the placeholder cuts the message off under
+  // its first screenful.
   useEffect(() => {
     const cached = measuredHeights.get(`${documentKey}:${appearanceRef.current}`)
-    const nextHeight = cached ?? DEFAULT_FRAME_HEIGHT
-    heightRef.current = nextHeight
-    measuredRef.current = cached !== undefined
-    setHeight(nextHeight)
-    setMeasured(cached !== undefined)
+    if (cached !== undefined) {
+      heightRef.current = cached
+      measuredRef.current = true
+      setHeight(cached)
+      setMeasured(true)
+      return
+    }
+    if (heightRef.current > DEFAULT_FRAME_HEIGHT) return
+    heightRef.current = DEFAULT_FRAME_HEIGHT
+    measuredRef.current = false
+    setHeight(DEFAULT_FRAME_HEIGHT)
+    setMeasured(false)
   }, [documentKey])
 
   useEffect(() => {
@@ -178,191 +188,243 @@ export function BubbleHtmlFrame({
       // still installed, and the load event wires this one again.
       if (doc.documentElement.getAttribute(FRAME_GENERATION_MARKER) !== generation) return
 
-      let animationFrame = 0
-      let disposed = false
-      // Per document: what its out-of-flow content was last seen to need.
-      let overflowExtent = 0
-      const cleanupFns: Array<() => void> = []
-
-      const commitHeight = (nextHeight: number) => {
-        if (disposed) return
-        // Filed under the document this handler was installed for, in whatever
-        // appearance is painting it now: a later document has its own handler.
-        measuredHeights.set(`${documentKey}:${appearanceRef.current}`, nextHeight)
-        if (!measuredRef.current) {
-          measuredRef.current = true
-          setMeasured(true)
+      // Show the text immediately. Pictures with a real width and height
+      // already have a box; ones marked height="auto" grow the frame when
+      // they arrive. Remote pictures load only when this message is allowed
+      // to, through the iframe's own request. The theme walk stays on the
+      // next turn so it does not hold the first paint.
+      const foldQuote = installFrameQuoteFold(doc, quoteKey, {
+        show: t('chat.showQuotedText'),
+        hide: t('chat.hideQuotedText'),
+      })
+      foldQuoteRef.current = foldQuote
+      reserveImageBoxes(doc)
+      let cancelInstall = () => {}
+      let cancelled = false
+      const publish = (nextHeight: number) => {
+        if (cancelled || nextHeight <= MIN_FRAME_HEIGHT) return
+        // A later, shorter read is a real reflow (a wider frame, a folded
+        // quote). A read that is still the placeholder is the frame not
+        // having laid the message out yet, and must not replace the text.
+        if (
+          nextHeight <= DEFAULT_FRAME_HEIGHT &&
+          heightRef.current > DEFAULT_FRAME_HEIGHT &&
+          doc.documentElement.clientHeight <= DEFAULT_FRAME_HEIGHT
+        ) {
+          return
         }
-        if (Math.abs(nextHeight - heightRef.current) < HEIGHT_CHANGE_EPSILON) return
+        measuredHeights.set(`${documentKey}:${appearanceRef.current}`, nextHeight)
         heightRef.current = nextHeight
+        measuredRef.current = true
+        setMeasured(true)
         setHeight(nextHeight)
       }
-
-      const scheduleMeasure = () => {
-        if (disposed) return
-        if (animationFrame) return
-        animationFrame = window.requestAnimationFrame(() => {
-          animationFrame = 0
-          measure()
-        })
+      publish(measureFrameHeight(frameMetrics(doc)).height)
+      // The load event can run before the iframe has its column width. Read
+      // again once that layout exists; the text height does not depend on
+      // pictures.
+      const afterLayout = window.requestAnimationFrame(() => {
+        if (!cancelled) publish(measureFrameHeight(frameMetrics(doc)).height)
+      })
+      const paintTimer = window.setTimeout(() => {
+        if (!cancelled) cancelInstall = install() ?? (() => {})
+      }, 0)
+      return () => {
+        cancelled = true
+        window.cancelAnimationFrame(afterLayout)
+        window.clearTimeout(paintTimer)
+        if (foldQuoteRef.current === foldQuote) foldQuoteRef.current = null
+        cancelInstall()
       }
 
-      // Only a document of plain flowing text can shrink its bubble: tables,
-      // images and the like lay out against the width they are given. The body
-      // is briefly laid out at max-content to read what its longest line needs;
-      // it is restored before anything paints or any observer is delivered.
-      const reportNaturalWidth = () => {
-        const report = onNaturalWidthRef.current
-        if (!report || !doc.body) return
-        const commit = (width: number | null) => {
-          naturalWidths.set(documentKey, width)
-          report(width)
+      function install() {
+        let animationFrame = 0
+        let disposed = false
+        // Per document: what its out-of-flow content was last seen to need.
+        let overflowExtent = 0
+        const cleanupFns: Array<() => void> = []
+
+        const commitHeight = (nextHeight: number) => {
+          if (disposed) return
+          // Filed under the document this handler was installed for, in whatever
+          // appearance is painting it now: a later document has its own handler.
+          measuredHeights.set(`${documentKey}:${appearanceRef.current}`, nextHeight)
+          if (!measuredRef.current) {
+            measuredRef.current = true
+            setMeasured(true)
+          }
+          if (Math.abs(nextHeight - heightRef.current) < HEIGHT_CHANGE_EPSILON) return
+          heightRef.current = nextHeight
+          setHeight(nextHeight)
         }
-        if (doc.querySelector(NON_TEXT_SELECTOR)) return commit(null)
-        const style = doc.body.style
-        // The base stylesheet caps the body at the frame's width (!important), which
-        // would make this read no more than the current width: lift it while measuring.
-        const saved = (prop: string) => [style.getPropertyValue(prop), style.getPropertyPriority(prop)] as const
-        const [previous, previousPriority] = saved('width')
-        const [previousMax, previousMaxPriority] = saved('max-width')
-        style.setProperty('width', 'max-content', 'important')
-        style.setProperty('max-width', 'none', 'important')
-        const natural = Math.ceil(doc.body.getBoundingClientRect().width)
-        if (previous) style.setProperty('width', previous, previousPriority)
-        else style.removeProperty('width')
-        if (previousMax) style.setProperty('max-width', previousMax, previousMaxPriority)
-        else style.removeProperty('max-width')
-        commit(natural > 0 ? natural : null)
-      }
 
-      const measure = () => {
-        wrapOverflowingTables()
-        reportNaturalWidth()
-        const measurement = measureFrameHeight(frameMetrics(doc), overflowExtent)
-        overflowExtent = measurement.overflowExtent
-        commitHeight(measurement.height)
-      }
+        const scheduleMeasure = () => {
+          if (disposed) return
+          if (animationFrame) return
+          animationFrame = window.requestAnimationFrame(() => {
+            animationFrame = 0
+            measure()
+          })
+        }
 
-      // The body can't scroll sideways (the frame is `scrolling="no"` so it can
-      // self-size), so anything wider than the frame would be clipped outright.
-      // Give the outermost overflowing table its own horizontal scroller — or,
-      // with auto-fit on, shrink it to the bubble, the way the mobile reader
-      // fits fixed-width mail. `zoom` rather than a transform: it scales the
-      // layout box too, so the height measured below is the height drawn.
-      const fitTables = new Map<HTMLTableElement, { natural: number; zoom: number }>()
-      const wrapOverflowingTables = () => {
-        const limit = doc.documentElement?.clientWidth ?? 0
-        if (!limit) return
-        for (const table of doc.querySelectorAll<HTMLTableElement>('table')) {
-          if (table.closest('.meron-table-scroll')) continue
-          const rect = table.getBoundingClientRect()
-          const overflowsFrame = rect.left < -1 || rect.right > limit + 1
-          const overflowsItself = table.scrollWidth > table.clientWidth + 1
-          if (!overflowsFrame && !overflowsItself) continue
+        // Only a document of plain flowing text can shrink its bubble: tables,
+        // images and the like lay out against the width they are given. The body
+        // is briefly laid out at max-content to read what its longest line needs;
+        // it is restored before anything paints or any observer is delivered.
+        const reportNaturalWidth = () => {
+          const report = onNaturalWidthRef.current
+          if (!report || !doc.body) return
+          const commit = (width: number | null) => {
+            naturalWidths.set(documentKey, width)
+            report(width)
+          }
+          if (doc.querySelector(NON_TEXT_SELECTOR)) return commit(null)
+          const style = doc.body.style
+          // The base stylesheet caps the body at the frame's width (!important), which
+          // would make this read no more than the current width: lift it while measuring.
+          const saved = (prop: string) => [style.getPropertyValue(prop), style.getPropertyPriority(prop)] as const
+          const [previous, previousPriority] = saved('width')
+          const [previousMax, previousMaxPriority] = saved('max-width')
+          style.setProperty('width', 'max-content', 'important')
+          style.setProperty('max-width', 'none', 'important')
+          const natural = Math.ceil(doc.body.getBoundingClientRect().width)
+          if (previous) style.setProperty('width', previous, previousPriority)
+          else style.removeProperty('width')
+          if (previousMax) style.setProperty('max-width', previousMax, previousMaxPriority)
+          else style.removeProperty('max-width')
+          commit(natural > 0 ? natural : null)
+        }
 
-          const wrapper = doc.createElement('div')
-          wrapper.className = 'meron-table-scroll'
-          table.parentNode?.insertBefore(wrapper, table)
-          wrapper.appendChild(table)
-          // The width it lays out at unscaled, read once: re-reading it would
-          // mean dropping the zoom on every measurement.
-          if (autoFitRef.current) {
-            fitTables.set(table, { natural: Math.max(table.scrollWidth, table.offsetWidth), zoom: 1 })
+        const measure = () => {
+          wrapOverflowingTables()
+          reportNaturalWidth()
+          const measurement = measureFrameHeight(frameMetrics(doc), overflowExtent)
+          overflowExtent = measurement.overflowExtent
+          commitHeight(measurement.height)
+        }
+
+        // The body can't scroll sideways (the frame is `scrolling="no"` so it can
+        // self-size), so anything wider than the frame would be clipped outright.
+        // Give the outermost overflowing table its own horizontal scroller — or,
+        // with auto-fit on, shrink it to the bubble, the way the mobile reader
+        // fits fixed-width mail. `zoom` rather than a transform: it scales the
+        // layout box too, so the height measured below is the height drawn.
+        const fitTables = new Map<HTMLTableElement, { natural: number; zoom: number }>()
+        const wrapOverflowingTables = () => {
+          const limit = doc.documentElement?.clientWidth ?? 0
+          if (!limit) return
+          for (const table of doc.querySelectorAll<HTMLTableElement>('table')) {
+            if (table.closest('.meron-table-scroll')) continue
+            const rect = table.getBoundingClientRect()
+            const overflowsFrame = rect.left < -1 || rect.right > limit + 1
+            const overflowsItself = table.scrollWidth > table.clientWidth + 1
+            if (!overflowsFrame && !overflowsItself) continue
+
+            const wrapper = doc.createElement('div')
+            wrapper.className = 'meron-table-scroll'
+            table.parentNode?.insertBefore(wrapper, table)
+            wrapper.appendChild(table)
+            // The width it lays out at unscaled, read once: re-reading it would
+            // mean dropping the zoom on every measurement.
+            if (autoFitRef.current) {
+              fitTables.set(table, { natural: Math.max(table.scrollWidth, table.offsetWidth), zoom: 1 })
+            }
+          }
+          for (const [table, fit] of fitTables) {
+            const room = table.parentElement?.clientWidth ?? 0
+            if (!room || !fit.natural) continue
+            const zoom = Math.min(1, room / fit.natural)
+            // Kept here, not read back off the style: the engine may serialise it
+            // differently, and a write every measurement would relayout forever.
+            if (Math.abs(zoom - fit.zoom) < 0.001) continue
+            fit.zoom = zoom
+            table.style.setProperty('zoom', String(zoom))
           }
         }
-        for (const [table, fit] of fitTables) {
-          const room = table.parentElement?.clientWidth ?? 0
-          if (!room || !fit.natural) continue
-          const zoom = Math.min(1, room / fit.natural)
-          // Kept here, not read back off the style: the engine may serialise it
-          // differently, and a write every measurement would relayout forever.
-          if (Math.abs(zoom - fit.zoom) < 0.001) continue
-          fit.zoom = zoom
-          table.style.setProperty('zoom', String(zoom))
-        }
-      }
 
-      for (const pre of doc.querySelectorAll<HTMLPreElement>('pre')) {
-        if (pre.closest('.meron-code-block')) continue
-        // GitLab diff rows use one <pre> per line-content cell; wrapping each
-        // one would add a copy button and block padding to every diff row.
-        if (pre.closest('td.line_content, th.line_content')) continue
+        for (const pre of doc.querySelectorAll<HTMLPreElement>('pre')) {
+          if (pre.closest('.meron-code-block')) continue
+          // GitLab diff rows use one <pre> per line-content cell; wrapping each
+          // one would add a copy button and block padding to every diff row.
+          if (pre.closest('td.line_content, th.line_content')) continue
 
-        const wrapper = doc.createElement('div')
-        wrapper.className = 'meron-code-block'
-        pre.parentNode?.insertBefore(wrapper, pre)
-        wrapper.appendChild(pre)
+          const wrapper = doc.createElement('div')
+          wrapper.className = 'meron-code-block'
+          pre.parentNode?.insertBefore(wrapper, pre)
+          wrapper.appendChild(pre)
 
-        const button = doc.createElement('button')
-        button.type = 'button'
-        button.className = 'meron-copy-code'
-        const copyCodeText = t('chat.copyCode')
-        button.title = copyCodeText
-        button.setAttribute('aria-label', copyCodeText)
-        button.innerHTML = `
+          const button = doc.createElement('button')
+          button.type = 'button'
+          button.className = 'meron-copy-code'
+          const copyCodeText = t('chat.copyCode')
+          button.title = copyCodeText
+          button.setAttribute('aria-label', copyCodeText)
+          button.innerHTML = `
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <rect width="14" height="14" x="8" y="8" rx="2" ry="2"></rect>
           <path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"></path>
         </svg>
       `
-        button.addEventListener('click', (event) => {
-          event.preventDefault()
-          event.stopPropagation()
-          copyText(pre.innerText).catch(() => undefined)
-        })
-        wrapper.appendChild(button)
-      }
+          button.addEventListener('click', (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            copyText(pre.innerText).catch(() => undefined)
+          })
+          wrapper.appendChild(button)
+        }
 
-      // Before the first measurement, so a folded quote never flashes open.
-      const foldQuote = installFrameQuoteFold(doc, quoteKey, {
-        show: t('chat.showQuotedText'),
-        hide: t('chat.hideQuotedText'),
-      })
-      foldQuoteRef.current = foldQuote
-      cleanupFns.push(() => {
-        if (foldQuoteRef.current === foldQuote) foldQuoteRef.current = null
-      })
+        // Listen before the theme walk. Pictures that arrive during that walk
+        // would otherwise finish with nobody watching, and the frame would
+        // stay at the banner until the walk ended.
+        const observer = new ResizeObserver(measure)
+        observer.observe(doc.documentElement)
+        if (doc.body) observer.observe(doc.body)
 
-      applyBubbleTheme(doc, bubbleThemeRef.current)
-      setFrameDoc(doc)
-      cleanupFns.push(() => setFrameDoc((current) => (current === doc ? null : current)))
+        for (const image of doc.querySelectorAll<HTMLImageElement>('img')) {
+          if (image.complete) continue
+          // One request: the iframe's own image. Once its pixels are here,
+          // keep the box so a later measure does not collapse it.
+          const onLoad = () => {
+            if (image.naturalWidth > 0 && image.naturalHeight > 0 && !image.style.aspectRatio) {
+              image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`
+            }
+            scheduleMeasure()
+          }
+          image.addEventListener('load', onLoad)
+          image.addEventListener('error', scheduleMeasure)
+          cleanupFns.push(() => {
+            image.removeEventListener('load', onLoad)
+            image.removeEventListener('error', scheduleMeasure)
+          })
+        }
 
-      measure()
-      const observer = new ResizeObserver(measure)
-      observer.observe(doc.documentElement)
-      if (doc.body) observer.observe(doc.body)
-
-      for (const image of doc.querySelectorAll<HTMLImageElement>('img')) {
-        if (image.complete) continue
-        image.addEventListener('load', scheduleMeasure)
-        image.addEventListener('error', scheduleMeasure)
+        const frameWindow = doc.defaultView
+        frameWindow?.addEventListener('load', scheduleMeasure)
+        frameWindow?.addEventListener('resize', scheduleMeasure)
         cleanupFns.push(() => {
-          image.removeEventListener('load', scheduleMeasure)
-          image.removeEventListener('error', scheduleMeasure)
+          frameWindow?.removeEventListener('load', scheduleMeasure)
+          frameWindow?.removeEventListener('resize', scheduleMeasure)
         })
-      }
 
-      const frameWindow = doc.defaultView
-      frameWindow?.addEventListener('load', scheduleMeasure)
-      frameWindow?.addEventListener('resize', scheduleMeasure)
-      cleanupFns.push(() => {
-        frameWindow?.removeEventListener('load', scheduleMeasure)
-        frameWindow?.removeEventListener('resize', scheduleMeasure)
-      })
+        const shortTimer = window.setTimeout(scheduleMeasure, 100)
+        const longTimer = window.setTimeout(scheduleMeasure, 500)
+        const fontReady = doc.fonts?.ready.then(scheduleMeasure).catch(() => undefined)
+        void fontReady
 
-      const shortTimer = window.setTimeout(scheduleMeasure, 100)
-      const longTimer = window.setTimeout(scheduleMeasure, 500)
-      const fontReady = doc.fonts?.ready.then(scheduleMeasure).catch(() => undefined)
-      void fontReady
+        applyBubbleTheme(doc, bubbleThemeRef.current)
+        setFrameDoc(doc)
+        cleanupFns.push(() => setFrameDoc((current) => (current === doc ? null : current)))
+        measure()
 
-      return () => {
-        disposed = true
-        if (animationFrame) window.cancelAnimationFrame(animationFrame)
-        observer.disconnect()
-        window.clearTimeout(shortTimer)
-        window.clearTimeout(longTimer)
-        cleanupFns.forEach((cleanup) => cleanup())
+        return () => {
+          disposed = true
+          if (animationFrame) window.cancelAnimationFrame(animationFrame)
+          observer.disconnect()
+          window.clearTimeout(shortTimer)
+          window.clearTimeout(longTimer)
+          cleanupFns.forEach((cleanup) => cleanup())
+        }
       }
     },
     [documentKey, generation, quoteKey],
@@ -401,7 +463,7 @@ export function BubbleHtmlFrame({
             prepareHtml={prepareHtml}
             title={t('chat.messageHtml')}
             className="block w-full border-0 bg-transparent"
-            style={{ height, overflow: 'hidden', visibility: measured ? 'visible' : 'hidden' }}
+            style={{ height, overflow: 'hidden' }}
             scrolling="no"
             onFrameClick={handleFrameClick}
             onReady={handleReady}

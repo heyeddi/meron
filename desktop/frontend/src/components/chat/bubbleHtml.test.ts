@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'bun:test'
-import { applyBubbleTheme, prepareBubbleHtml } from './bubbleHtml'
+import { applyBubbleTheme, prepareBubbleHtml, reserveImageBoxes } from './bubbleHtml'
 import {
   DARKENED_ATTR,
   DEFAULT_BUBBLE_THEME,
+  FRAME_STYLE_MARKER,
   PICTURE_ATTR,
   bubbleThemeFromTokens,
   frameVar,
@@ -211,6 +212,33 @@ describe('prepareBubbleHtml', () => {
 
       const style = themedFrame(html, DEFAULT_BUBBLE_THEME)
       expect(style.canvas()).toBe('')
+    })
+
+    it('reserves a box for an image that declares its size', () => {
+      const doc = new DOMParser().parseFromString(
+        prepareBubbleHtml(
+          '<img width="600" height="400" src="https://cdn.example/hero.png"><img width="100%" height="40" src="https://cdn.example/bar.png"><p>After</p>',
+        ),
+        'text/html',
+      )
+
+      reserveImageBoxes(doc)
+
+      const [hero, bar] = [...doc.querySelectorAll('img')]
+      expect(hero?.style.aspectRatio).toBe('600 / 400')
+      // A percentage width is not a length the box can be built from.
+      expect(bar?.style.aspectRatio).toBe('')
+    })
+
+    it('ignores a stylesheet that arrived claiming to be the frame stylesheet', () => {
+      const html =
+        '<html><head><style data-meron-frame-style="stolen">p{color:red}</style></head><body><p>Hi</p></body></html>'
+      const doc = new DOMParser().parseFromString(prepareBubbleHtml(html), 'text/html')
+      const marked = [...doc.querySelectorAll(`style[${FRAME_STYLE_MARKER}]`)]
+
+      expect(marked).toHaveLength(1)
+      expect(marked[0]?.getAttribute(FRAME_STYLE_MARKER)).not.toBe('stolen')
+      expect(marked[0]?.textContent).toContain('overflow-wrap')
     })
 
     it('stamps the generation the host asked for', () => {

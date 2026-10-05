@@ -1,6 +1,6 @@
 import { BUBBLE_CODE_BASE_PX, BUBBLE_HTML_BASE_PX, type MessageFrameFont } from '../../lib/fonts'
 import { QUOTE_FOLDED_CLASS, QUOTE_TOGGLE_CLASS } from './quoteFold'
-import { allowRemoteContent, blockRemoteContent } from './remoteContentCsp'
+import { allowRemoteInCsp, blockRemoteInCsp } from './remoteContentCsp'
 import {
   DARKENED_ATTR,
   DARKENED_CSS,
@@ -8,7 +8,6 @@ import {
   LIGHT_ON_DARK_TEXT,
   colorTone,
   darkensCanvas,
-  disownStyleElements,
   frameCanvas,
   frameVar,
   frameVarPrefix,
@@ -22,9 +21,196 @@ import {
 /** The attribute `prepareBubbleHtml` stamps its generation on. */
 export const FRAME_GENERATION_MARKER = 'data-meron-generation'
 
+/**
+ * Give a not-yet-loaded image the box its width and height attributes describe.
+ *
+ * The frame stylesheet sets `height: auto`, so without this an image contributes
+ * nothing until its bytes arrive. `height="auto"` is not a length: those
+ * pictures paint into the message as they arrive, and the frame grows with them.
+ */
+export function reserveImageBoxes(doc: Document) {
+  for (const el of doc.querySelectorAll<HTMLElement>('img[width][height], video[width][height]')) {
+    if (el.style.aspectRatio) continue
+    const width = plainLength(el.getAttribute('width'))
+    const height = plainLength(el.getAttribute('height'))
+    if (width === null || height === null) continue
+    el.style.aspectRatio = `${width} / ${height}`
+  }
+}
+
+function plainLength(value: string | null): number | null {
+  if (!value || !/^\d+(\.\d+)?$/.test(value.trim())) return null
+  const parsed = Number(value)
+  return parsed > 0 ? parsed : null
+}
+
 const DEFAULT_MESSAGE_FRAME_FONT: MessageFrameFont = {
   family: null,
   zoom: 1,
+}
+
+const SIZING_STYLE = 'height: auto !important; min-height: 0 !important'
+
+// An empty document, only so the frame stylesheet can be built. The message
+// itself is never parsed here: WebKit parses it once, as the iframe's srcdoc.
+function emptyDocument(): Document {
+  return document.implementation?.createHTMLDocument?.('') ?? new DOMParser().parseFromString('', 'text/html')
+}
+
+function endOfTag(html: string, start: number): number {
+  let quote: string | null = null
+  for (let i = start; i < html.length; i++) {
+    const char = html[i]
+    if (quote) {
+      if (char === quote) quote = null
+      continue
+    }
+    if (char === '"' || char === "'") {
+      quote = char
+      continue
+    }
+    if (char === '>') return i + 1
+  }
+  return -1
+}
+
+function findOpenTag(html: string, name: string): { start: number; end: number; attrs: string } | null {
+  const lower = html.toLowerCase()
+  const needle = `<${name}`
+  let from = 0
+  while (from < html.length) {
+    const comment = lower.indexOf('<!--', from)
+    const at = lower.indexOf(needle, from)
+    if (at < 0) return null
+    if (comment !== -1 && comment < at) {
+      const close = lower.indexOf('-->', comment + 4)
+      from = close < 0 ? html.length : close + 3
+      continue
+    }
+    const next = lower[at + needle.length]
+    if (next && /[a-z0-9]/.test(next)) {
+      from = at + needle.length
+      continue
+    }
+    const end = endOfTag(html, at)
+    if (end < 0) return null
+    return { start: at, end, attrs: html.slice(at + needle.length, end - 1) }
+  }
+  return null
+}
+
+function findCloseTag(html: string, name: string): number {
+  const lower = html.toLowerCase()
+  const needle = `</${name}`
+  let from = 0
+  while (from < html.length) {
+    const at = lower.indexOf(needle, from)
+    if (at < 0) return -1
+    const next = lower[at + needle.length]
+    if (!next || next === '>' || /\s/.test(next)) return at
+    from = at + needle.length
+  }
+  return -1
+}
+
+function replaceOpenTag(html: string, name: string, tag: { start: number; end: number }, attrs: string): string {
+  const rawName = html.slice(tag.start + 1, tag.start + 1 + name.length)
+  return `${html.slice(0, tag.start)}<${rawName}${attrs}>${html.slice(tag.end)}`
+}
+
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+}
+
+function withGeneration(attrs: string, generation: string): string {
+  const without = attrs.replace(/\sdata-meron-generation\s*=\s*(?:"[^"]*"|'[^']*')/i, '')
+  return `${without} ${FRAME_GENERATION_MARKER}="${escapeAttr(generation)}"`
+}
+
+function withSizing(attrs: string): string {
+  const match = attrs.match(/\sstyle\s*=\s*(["'])([\s\S]*?)\1/i)
+  if (!match) return `${attrs} style="${SIZING_STYLE}"`
+  const value = match[2]
+    .replace(/(?:^|;)\s*min-height\s*:[^;]*/gi, '')
+    .replace(/(?:^|;)\s*height\s*:[^;]*/gi, '')
+    .replace(/^\s*;+\s*|\s*;+\s*$/g, '')
+    .trim()
+  const next = value ? `${value}; ${SIZING_STYLE}` : SIZING_STYLE
+  return attrs.replace(match[0], ` style=${match[1]}${next}${match[1]}`)
+}
+
+function rewriteCspMetas(html: string, rewrite: (csp: string) => string): string {
+  const lower = html.toLowerCase()
+  let out = ''
+  let from = 0
+  while (from < html.length) {
+    const at = lower.indexOf('<meta', from)
+    if (at < 0) return out + html.slice(from)
+    const next = lower[at + 5]
+    if (next && /[a-z0-9]/.test(next)) {
+      out += html.slice(from, at + 5)
+      from = at + 5
+      continue
+    }
+    const end = endOfTag(html, at)
+    if (end < 0) return out + html.slice(from)
+    out += html.slice(from, at) + rewriteCspMeta(html.slice(at, end), rewrite)
+    from = end
+  }
+  return out
+}
+
+function rewriteCspMeta(tag: string, rewrite: (csp: string) => string): string {
+  if (!/http-equiv\s*=\s*["']content-security-policy["']/i.test(tag)) return tag
+  return tag.replace(/content\s*=\s*(["'])([\s\S]*?)\1/i, (_full, quote: string, content: string) => {
+    return `content=${quote}${rewrite(content)}${quote}`
+  })
+}
+
+// A fragment, or a document missing head or body, still has to carry the frame
+// markup on the elements the iframe parser will use.
+function ensureDocument(html: string): string {
+  if (!findOpenTag(html, 'html')) {
+    return `<!doctype html><html><head></head><body>${html}</body></html>`
+  }
+  let out = html
+  if (!findOpenTag(out, 'head')) {
+    const htmlTag = findOpenTag(out, 'html')!
+    out = `${out.slice(0, htmlTag.end)}<head></head>${out.slice(htmlTag.end)}`
+  }
+  if (findCloseTag(out, 'head') < 0) {
+    const body = findOpenTag(out, 'body')
+    const at = body ? body.start : out.length
+    out = `${out.slice(0, at)}</head>${out.slice(at)}`
+  }
+  if (!findOpenTag(out, 'body')) {
+    const afterHead = findCloseTag(out, 'head') + '</head>'.length
+    const htmlClose = findCloseTag(out, 'html')
+    const end = htmlClose < 0 ? out.length : htmlClose
+    out = `${out.slice(0, afterHead)}<body>${out.slice(afterHead, end)}</body>${out.slice(end)}`
+  }
+  return out
+}
+
+function assembleBubbleDocument(
+  html: string,
+  csp: string,
+  style: string,
+  allowRemote: boolean,
+  generation: string,
+): string {
+  const rewrite = allowRemote ? allowRemoteInCsp : blockRemoteInCsp
+  let out = ensureDocument(
+    rewriteCspMetas(html.replace(/\sdata-meron-frame-style\s*=\s*(?:"[^"]*"|'[^']*')/gi, ''), rewrite),
+  )
+  const htmlTag = findOpenTag(out, 'html')!
+  out = replaceOpenTag(out, 'html', htmlTag, withSizing(withGeneration(htmlTag.attrs, generation)))
+  const bodyTag = findOpenTag(out, 'body')!
+  out = replaceOpenTag(out, 'body', bodyTag, withSizing(bodyTag.attrs))
+  const headClose = findCloseTag(out, 'head')
+  out = `${out.slice(0, headClose)}${style}${out.slice(headClose)}`
+  const headTag = findOpenTag(out, 'head')!
+  return `${out.slice(0, headTag.end)}${csp}${out.slice(headTag.end)}`
 }
 
 // Sanitises and styles an email's HTML body before it's rendered inside the
@@ -44,8 +230,10 @@ export function prepareBubbleHtml(
   generation = '',
 ) {
   try {
-    const parser = new DOMParser()
-    const doc = parser.parseFromString(html, 'text/html')
+    // Build the frame's own tags on an empty document. Parsing the message
+    // here and serialising it back made WebKit parse every newsletter twice
+    // before the iframe could paint.
+    const doc = emptyDocument()
 
     // The iframe runs with `allow-scripts` (so our link-click handler fires),
     // so we must block the email's own JS here. `default-src 'none'` denies
@@ -70,23 +258,6 @@ export function prepareBubbleHtml(
       'content',
       `default-src 'none'; script-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; ${media}; style-src 'unsafe-inline'; font-src * data:;`,
     )
-    doc.head.insertBefore(csp, doc.head.firstChild)
-
-    // The body arrives with the sidecar's own CSP meta, baked from the policy in
-    // force when it was read. Rewrite it in place so a decision made since then
-    // takes effect without a refetch: loosen it once the user reveals this
-    // message (or allows its sender), tighten it once that trust is withdrawn.
-    if (allowRemote) allowRemoteContent(doc)
-    else blockRemoteContent(doc)
-
-    // Anything that arrived claiming to be a frame stylesheet isn't one — the
-    // marker is also where this document's variable prefix travels.
-    disownStyleElements(doc)
-    // Which document this is. A frame is wired as soon as its srcDoc changes,
-    // while the one it replaces is still loaded, so the host checks this before
-    // it treats what it finds as the document it just asked for. Sanitising
-    // drops every `data-*` attribute, so sender markup can't carry one.
-    doc.documentElement.setAttribute(FRAME_GENERATION_MARKER, generation)
 
     const style = doc.createElement('style')
     ownStyleElement(style)
@@ -256,8 +427,6 @@ export function prepareBubbleHtml(
         background: rgba(0, 0, 0, 0.004) !important;
       }
     `
-    doc.head.appendChild(style)
-
     // A self-sizing frame needs its document boxes to follow the message.
     // Newsletter resets commonly force both boxes to height:100%, which pins
     // them to the placeholder viewport; with overflow hidden that also hides
@@ -267,11 +436,8 @@ export function prepareBubbleHtml(
     // rules the later one wins. Inline declarations outrank every stylesheet
     // rule of the same importance, so they win wherever the reset sits — and
     // unlike an appended `<style>` they leave `:last-child` and friends alone.
-    for (const el of [doc.documentElement, doc.body]) {
-      el.style.setProperty('height', 'auto', 'important')
-      el.style.setProperty('min-height', '0', 'important')
-    }
-    return doc.documentElement.outerHTML
+    // Spliced into the source string so the iframe's parse is the only one.
+    return assembleBubbleDocument(html, csp.outerHTML, style.outerHTML, allowRemote, generation)
   } catch {
     return html
   }
