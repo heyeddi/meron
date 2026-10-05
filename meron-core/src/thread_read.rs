@@ -160,10 +160,13 @@ pub async fn read_thread_page(
                 // reply_to/cc/references populate. Real-world mail almost
                 // always carries a Message-ID, so emptiness is a reliable
                 // "pre-extraction cache" signal.
-                let complete = cached.as_ref().is_some_and(|message| {
-                    !message.message_id.is_empty()
-                        && parse::cached_media_available(&media_root, message)
-                });
+                //
+                // Missing attachment files do not block the body. A pruned
+                // image used to force a full RFC822 download before the text
+                // could paint; that download now runs in the background.
+                let complete = cached
+                    .as_ref()
+                    .is_some_and(|message| !message.message_id.is_empty());
                 Slot {
                     folder: msg_folder,
                     cached,
@@ -252,11 +255,25 @@ pub async fn read_thread_page(
                 }
                 Err(err) => return Err(err),
             }
-            let background: Vec<(String, u32)> = missing
+            let mut background: Vec<(String, u32)> = missing
                 .iter()
                 .filter(|&&idx| !slots[idx].complete)
                 .map(|&idx| (slots[idx].folder.clone(), headers[idx].uid))
                 .collect();
+            // Bodies we can already show, whose attachment bytes are gone.
+            for (idx, slot) in slots.iter().enumerate() {
+                let needs_media = slot.complete
+                    && slot.cached.as_ref().is_some_and(|message| {
+                        !parse::cached_media_available(&media_root, message)
+                    });
+                if !needs_media {
+                    continue;
+                }
+                let item = (slot.folder.clone(), headers[idx].uid);
+                if !background.contains(&item) {
+                    background.push(item);
+                }
+            }
             if !background.is_empty() {
                 spawn_fill_thread_bodies(
                     engine,
@@ -280,10 +297,13 @@ pub async fn read_thread_page(
     };
     let mut seen_message_ids = HashSet::new();
     let mut messages = Vec::with_capacity(headers.len());
+    let mut views_to_store = Vec::new();
     for (header, slot) in headers.iter().zip(slots) {
         let mut cached = slot.cached;
-        if let Some(message) = cached.as_mut() {
-            attach_html(message, &remote_policy);
+        if let Some(message) = cached.as_mut()
+            && let Some(view) = attach_html(message, &remote_policy)
+        {
+            views_to_store.push((slot.folder.clone(), header.uid, view));
         }
         // Newly synced envelope rows do not have json.message_id yet, so the
         // SQL-level cross-folder dedupe cannot collapse a self-addressed
@@ -305,6 +325,12 @@ pub async fn read_thread_page(
             &mine,
             &ours,
         ));
+    }
+    if !views_to_store.is_empty() {
+        let db = engine.db.lock().unwrap();
+        for (folder, uid, view) in views_to_store {
+            let _ = store::save_body_html_view(&db, account, &folder, uid, &view);
+        }
     }
 
     let mut out = json!({ "messages": messages });
@@ -362,8 +388,14 @@ async fn fetch_into_slots(
             .or_default()
             .push(headers[idx].uid);
     }
-    let fetched =
-        fetch_thread_bodies(engine, account, &by_folder, media_root.to_path_buf()).await?;
+    let fetched = fetch_thread_bodies(
+        engine,
+        account,
+        &by_folder,
+        media_root.to_path_buf(),
+        crate::engine::INLINE_BODY_BUDGET,
+    )
+    .await?;
     let db = engine.db.lock().unwrap();
     for (folder, uid, message) in fetched {
         let _ = store::save_cached_message(&db, account, &folder, uid, &message);
@@ -383,9 +415,10 @@ async fn fetch_thread_bodies(
     account: &str,
     by_folder: &BTreeMap<String, Vec<u32>>,
     media_root: PathBuf,
+    budget: std::time::Duration,
 ) -> anyhow::Result<Vec<(String, u32, parse::Message)>> {
     engine
-        .with_read_session(account, |session| {
+        .with_transfer_session(account, budget, |session| {
             let by_folder = by_folder.clone();
             let media_root = media_root.clone();
             let account = account.to_string();
@@ -431,7 +464,14 @@ fn spawn_fill_thread_bodies(
         let mut fetched_any = false;
         let fetch = async {
             let guard = MessageSyncGuard::begin(&engine)?;
-            let fetched = fetch_thread_bodies(&engine, &account, &by_folder, media_root).await?;
+            let fetched = fetch_thread_bodies(
+                &engine,
+                &account,
+                &by_folder,
+                media_root,
+                std::time::Duration::from_secs(120),
+            )
+            .await?;
             anyhow::Ok((guard, fetched))
         }
         .await;

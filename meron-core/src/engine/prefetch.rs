@@ -12,6 +12,15 @@ use super::*;
 /// everything received within this many days.
 pub const PREFETCH_DAYS: u32 = 14;
 
+/// Messages downloaded per IMAP session checkout. The session goes back to the
+/// pool between batches so opening a message can reuse it instead of waiting
+/// out the rest of the backlog or paying for a new TLS handshake.
+const PREFETCH_BATCH: usize = 4;
+
+/// One batch is a few full messages. Long enough for a slow server, short
+/// enough that a dead socket is not held for the whole backlog.
+const PREFETCH_BATCH_BUDGET: Duration = Duration::from_secs(120);
+
 #[derive(Clone, Debug)]
 pub struct BodyPrefetchOptions {
     pub days: u32,
@@ -30,23 +39,23 @@ impl Default for BodyPrefetchOptions {
 }
 
 pub(super) fn limit_prefetch_uids(mut pending: Vec<u32>, max_count: Option<usize>) -> Vec<u32> {
+    // SEARCH returns ascending UIDs. The reader opens the newest mail first, so
+    // warm that end before older messages. A cap (mobile) then keeps only it.
+    pending.reverse();
     if let Some(max_count) = max_count {
-        // SEARCH returns ascending UIDs. When mobile has a cap, spend the budget
-        // on the newest messages first; older unread mail remains available via
-        // the on-demand reader.
-        pending.reverse();
         pending.truncate(max_count);
     }
     pending
 }
 
 /// Download full message bodies (RFC822, attachments included) for a folder's
-/// unread + recent messages into the store, so opening them is instant and they
-/// read offline. Reuses one connection: SELECT + SEARCH once, then UID FETCH
-/// each pending UID. Skips messages whose body is already cached, so repeat runs
-/// converge to a cheap SEARCH; a run cut short (timeout) resumes on the next
-/// trigger since saved bodies persist. Layered over the on-demand reader, which
-/// still handles anything opened before the prefetcher reaches it.
+/// unread mail and its recent messages into the store, so opening them is instant
+/// and they read offline. Searches once, then fetches newest-first in short
+/// batches, returning the connection to the pool between batches. Skips messages
+/// whose body is already cached, so repeat runs converge to a cheap SEARCH; a
+/// run cut short resumes on the next trigger since saved bodies persist. Layered
+/// over the on-demand reader, which still handles anything opened before the
+/// prefetcher reaches it.
 pub async fn prefetch_bodies(
     engine: &Arc<Engine>,
     account: &str,
@@ -62,54 +71,55 @@ pub async fn prefetch_bodies_with_options(
     options: BodyPrefetchOptions,
 ) -> anyhow::Result<usize> {
     let _snapshot_guard = MessageSyncGuard::begin(engine)?;
-    engine
+    let uids = engine
         .with_read_session(account, |session| {
-            let engine = engine.clone();
-            let account = account.to_string();
             let folder = folder.to_string();
-            let options = options.clone();
-            Box::pin(async move {
-                let uids = imap::search_prefetch_uids(session, &folder, options.days).await?;
-
-                let pending: Vec<u32> = {
-                    let db = engine.db.lock().unwrap();
-                    uids.into_iter()
-                        .filter(|uid| {
-                            store::has_message(&db, &account, &folder, *uid).unwrap_or(false)
-                                && !store::has_cached_body(&db, &account, &folder, *uid)
-                                    .unwrap_or(false)
-                        })
-                        .collect()
-                };
-                let pending = limit_prefetch_uids(pending, options.max_count);
-
-                let mut fetched = 0usize;
-                for uid in pending {
-                    let media = parse::MediaCtx {
-                        root: options.media_root.clone(),
-                        account: account.to_string(),
-                        folder: folder.to_string(),
-                        uid,
-                    };
-                    // peek = true: warming bodies must not flip unread mail to read.
-                    match imap::fetch_full_message(session, uid, &media, true).await {
-                        Ok(Some(message)) => {
-                            let db = engine.db.lock().unwrap();
-                            let _ =
-                                store::save_cached_message(&db, &account, &folder, uid, &message);
-                            fetched += 1;
-                        }
-                        // Vanished between SEARCH and FETCH (e.g. moved/expunged): skip.
-                        Ok(None) => {}
-                        // Background warming: log and keep going so one bad message
-                        // doesn't abort the whole backlog.
-                        Err(e) => eprintln!("meron-core: prefetch {folder} uid {uid}: {e:#}"),
-                    }
-                }
-                anyhow::Ok(fetched)
-            })
+            let days = options.days;
+            Box::pin(async move { imap::search_prefetch_uids(session, &folder, days).await })
         })
-        .await
+        .await?;
+    let pending: Vec<u32> = {
+        let db = engine.db.lock().unwrap();
+        uids.into_iter()
+            .filter(|uid| {
+                store::has_message(&db, account, folder, *uid).unwrap_or(false)
+                    && !store::has_cached_body(&db, account, folder, *uid).unwrap_or(false)
+            })
+            .collect()
+    };
+    let pending = limit_prefetch_uids(pending, options.max_count);
+
+    let mut fetched = 0usize;
+    for chunk in pending.chunks(PREFETCH_BATCH) {
+        let chunk = chunk.to_vec();
+        let batch = engine
+            .with_transfer_session(account, PREFETCH_BATCH_BUDGET, |session| {
+                let folder = folder.to_string();
+                let account = account.to_string();
+                let chunk = chunk.clone();
+                let media_root = options.media_root.clone();
+                Box::pin(async move {
+                    // peek via fetch_bodies: warming must not flip unread mail to read.
+                    imap::fetch_bodies(session, &folder, &chunk, media_root, &account).await
+                })
+            })
+            .await;
+        match batch {
+            Ok(messages) => {
+                let db = engine.db.lock().unwrap();
+                for (uid, message) in messages {
+                    let _ = store::save_cached_message(&db, account, folder, uid, &message);
+                    fetched += 1;
+                }
+            }
+            // Saved batches stay cached; the next trigger continues with the rest.
+            Err(e) => {
+                eprintln!("meron-core: prefetch {folder}: {e:#}");
+                break;
+            }
+        }
+    }
+    Ok(fetched)
 }
 
 /// Fetch and cache the bodies of specific UIDs, skipping any already cached.
@@ -137,7 +147,7 @@ pub async fn fetch_bodies_for_uids(
     }
     let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     engine
-        .with_read_session(account, |session| {
+        .with_transfer_session(account, PREFETCH_BATCH_BUDGET, |session| {
             let engine = engine.clone();
             let account = account.to_string();
             let folder = folder.to_string();

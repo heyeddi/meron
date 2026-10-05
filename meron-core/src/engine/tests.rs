@@ -212,9 +212,10 @@ pub fn thread_gap_search_folders_dedup_case_insensitively() {
 
 #[test]
 pub fn prefetch_limit_keeps_all_uids_when_uncapped() {
+    // Uncapped runs still warm newest mail first; nothing is dropped.
     assert_eq!(
         limit_prefetch_uids(vec![1, 2, 3, 4], None),
-        vec![1, 2, 3, 4]
+        vec![4, 3, 2, 1]
     );
 }
 

@@ -601,6 +601,92 @@ impl Engine {
         self.with_session(account, true, f).await
     }
 
+    /// Run a read that transfers message bytes (a body FETCH).
+    ///
+    /// [`POOLED_READ_TIMEOUT`] only covers a NOOP on a reused socket, which is
+    /// enough to notice a connection the server has already dropped. The
+    /// download itself gets `budget`. Wrapping the FETCH in the short timeout
+    /// aborts a slow-but-alive transfer and starts it over, which is how a
+    /// large or high-latency message ends up taking twice as long to appear.
+    pub async fn with_transfer_session<T, F>(
+        &self,
+        account: &str,
+        budget: Duration,
+        mut f: F,
+    ) -> anyhow::Result<T>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        if let Some(mut session) = self.take_pooled(account) {
+            let probe = tokio::time::timeout(POOLED_READ_TIMEOUT, session.noop()).await;
+            match probe {
+                Ok(Ok(())) => {
+                    return self.finish_transfer(account, budget, session, &mut f).await;
+                }
+                Ok(Err(_)) | Err(_) => {
+                    pool_debug(account, "stale-retry");
+                    drop(session);
+                }
+            }
+        }
+
+        pool_debug(account, "fresh-connect");
+        let connect_lock = self.connect_lock(account);
+        let mut connect_guard =
+            tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
+                .await
+                .ok();
+        if let Some(mut session) = self.take_pooled(account) {
+            drop(connect_guard.take());
+            let probe = tokio::time::timeout(POOLED_READ_TIMEOUT, session.noop()).await;
+            if matches!(probe, Ok(Ok(()))) {
+                return self.finish_transfer(account, budget, session, &mut f).await;
+            }
+            drop(session);
+            connect_guard =
+                tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
+                    .await
+                    .ok();
+        }
+        let creds = self.ensure_valid_creds(account).await?;
+        let connect_started = std::time::Instant::now();
+        let session = imap::connect(&creds).await?;
+        let connect_ms = connect_started.elapsed().as_millis();
+        if connect_ms > 2_000 {
+            crate::mlog!(
+                crate::log::Level::Warn,
+                "net",
+                "slow IMAP connect for {account}: {connect_ms}ms"
+            );
+        }
+        drop(connect_guard);
+        self.finish_transfer(account, budget, session, &mut f).await
+    }
+
+    async fn finish_transfer<T, F>(
+        &self,
+        account: &str,
+        budget: Duration,
+        mut session: imap::Session,
+        f: &mut F,
+    ) -> anyhow::Result<T>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        match tokio::time::timeout(budget, f(&mut session)).await {
+            Ok(Ok(val)) => {
+                self.return_pooled(account, session);
+                Ok(val)
+            }
+            // A failed or timed-out transfer leaves the socket mid-command.
+            // Drop it instead of returning it to the pool.
+            Ok(Err(err)) => Err(err),
+            Err(_) => anyhow::bail!("IMAP transfer timed out after {}s", budget.as_secs()),
+        }
+    }
+
     /// Run a mutating operation against a pooled (or fresh) session. Never
     /// auto-retries, so a connection dropped mid-command can't double-apply.
     pub async fn with_write_session<T, F>(&self, account: &str, f: F) -> anyhow::Result<T>

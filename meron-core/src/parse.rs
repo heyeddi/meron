@@ -184,6 +184,11 @@ pub struct Message {
     /// handler injects a remote-image CSP `<meta>` on read (see `prepare_html`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_html: Option<String>,
+    /// Sanitized HTML without the remote-image CSP. Built once when the message
+    /// is parsed and reused on later reads; [`prepare_html`] stamps the CSP for
+    /// the policy in force at read time. Not sent to clients.
+    #[serde(default, skip_serializing)]
+    pub body_html_view: Option<String>,
     #[serde(default)]
     pub body_is_rendered: bool,
     pub preview: String,
@@ -514,6 +519,8 @@ pub fn parse_message(raw: &[u8], media: Option<&MediaCtx>) -> Message {
         }
         (None, None) => (String::new(), None, false),
     };
+    // Sanitize once, here, so opening the message later only stamps a CSP.
+    let body_html_view = body_html.as_deref().map(prepare_html_view);
     let preview = preview_of(&body);
 
     Message {
@@ -530,6 +537,7 @@ pub fn parse_message(raw: &[u8], media: Option<&MediaCtx>) -> Message {
         date,
         body,
         body_html,
+        body_html_view,
         body_is_rendered,
         preview,
         attachments,
@@ -953,37 +961,34 @@ fn split_important(value: &str) -> (&str, bool) {
     }
 }
 
+/// Bump when [`prepare_html_view`] changes, so cached views are rebuilt instead
+/// of served stale. Stored next to the view in the message JSON.
+pub const HTML_VIEW_VERSION: i64 = 1;
+
 /// Wrap stored HTML for safe iframe rendering: inject a CSP `<meta>` that allows
 /// same-origin (`/media`), data, and blob images/media always, and remote (`https:`)
 /// images/media only when the account opts in. The reader renders this in a `sandbox`ed
 /// iframe with `allow-scripts` (needed so the host's link-click listener fires under
 /// WebKitGTK); the `default-src 'none'` CSP still blocks all email JS, so the
 /// CSP also gates remote image/media loads.
+///
+/// The expensive sanitize step is [`prepare_html_view`] and is cached on the
+/// message. This stamps the policy-dependent CSP onto that view.
 pub fn prepare_html(source: &str, load_remote_images: bool) -> String {
-    // Defence in depth: strip script-bearing markup *before* the CSP `<meta>` is
+    apply_remote_image_csp(&prepare_html_view(source), load_remote_images)
+}
+
+/// Sanitized, quote-marked HTML with the reader's charset, canvas colors, and
+/// image sizing, and no CSP. Safe to store: the remote-image decision is applied
+/// later by [`apply_remote_image_csp`].
+pub fn prepare_html_view(source: &str) -> String {
+    // Defence in depth: strip script-bearing markup *before* anything else is
     // injected, so a CSP bypass alone can't run the email's JS. CSS is kept (the
     // CSP allows `style-src 'unsafe-inline'`); only script vectors are removed.
     let raw_source = source;
     // Marked after sanitizing, which drops every sender `data-*` attribute, so
     // the quote marker the frames fold on is always ours.
     let source = &crate::quote::mark_html_quote(&sanitize_email_html(source));
-    let (img, media) = if load_remote_images {
-        (
-            "'self' data: http: https:",
-            "'self' data: blob: http: https:",
-        )
-    } else {
-        ("'self' data:", "'self' data: blob:")
-    };
-    // `script-src`/`object-src`/`frame-src 'none'` are explicit for robustness
-    // (they already inherit from `default-src`); `base-uri` and `form-action` do
-    // NOT fall back to `default-src`, so they must be set to neutralise a `<base>`
-    // hijack or a form posting out of the frame.
-    let csp = format!(
-        "default-src 'none'; script-src 'none'; object-src 'none'; frame-src 'none'; \
-         base-uri 'none'; form-action 'none'; \
-         img-src {img}; media-src {media}; style-src 'unsafe-inline'; font-src 'self' data:;"
-    );
     // Keep oversized inline images within the reader width (preserving aspect), and
     // hint that they open the gallery. `style-src 'unsafe-inline'` covers this block.
     // The email's own canvas colors, hoisted off the `<body>` ammonia just
@@ -1007,11 +1012,35 @@ pub fn prepare_html(source: &str, load_remote_images: bool) -> String {
     }
     let head = format!(
         "<meta charset=\"utf-8\">\
-         <meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">\
          {body_colors}\
          <style>img,video{{max-width:100%;height:auto}}img{{cursor:zoom-in}}</style>"
     );
     inject_head(source, &head)
+}
+
+/// Stamp the remote-image CSP onto a cached [`prepare_html_view`] result.
+pub fn apply_remote_image_csp(view: &str, load_remote_images: bool) -> String {
+    let (img, media) = if load_remote_images {
+        (
+            "'self' data: http: https:",
+            "'self' data: blob: http: https:",
+        )
+    } else {
+        ("'self' data:", "'self' data: blob:")
+    };
+    // `script-src`/`object-src`/`frame-src 'none'` are explicit for robustness
+    // (they already inherit from `default-src`); `base-uri` and `form-action` do
+    // NOT fall back to `default-src`, so they must be set to neutralise a `<base>`
+    // hijack or a form posting out of the frame.
+    let csp = format!(
+        "default-src 'none'; script-src 'none'; object-src 'none'; frame-src 'none'; \
+         base-uri 'none'; form-action 'none'; \
+         img-src {img}; media-src {media}; style-src 'unsafe-inline'; font-src 'self' data:;"
+    );
+    inject_head(
+        view,
+        &format!("<meta http-equiv=\"Content-Security-Policy\" content=\"{csp}\">"),
+    )
 }
 
 /// Insert `head_extra` into the document head: after an existing `<head ...>`, or
@@ -2175,6 +2204,22 @@ AQID\r\n\
         assert!(html.contains("/media/acct/inbox/7/0.png"));
         assert!(!html.contains("cid:logo123"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepare_html_view_skips_sanitize_when_the_csp_changes() {
+        let source = "<p style=\"color:red\" onclick=\"steal()\">hi</p>";
+        let view = prepare_html_view(source);
+        assert!(!view.contains("Content-Security-Policy"), "{view}");
+        assert!(!view.contains("onclick"), "{view}");
+        assert!(view.contains("color:red"), "{view}");
+        let blocked = apply_remote_image_csp(&view, false);
+        let allowed = apply_remote_image_csp(&view, true);
+        assert!(blocked.contains("img-src 'self' data:;"));
+        assert!(!blocked.contains("https:"));
+        assert!(allowed.contains("https:"));
+        assert_eq!(blocked, prepare_html(source, false));
+        assert_eq!(allowed, prepare_html(source, true));
     }
 
     #[test]

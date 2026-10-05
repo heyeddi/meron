@@ -155,7 +155,11 @@ pub fn read_cached(
     if msg.message_id.is_empty() || !parse::cached_media_available(&media_root, &msg) {
         return None;
     }
-    attach_html(&mut msg, &remote_policy);
+    let view = attach_html(&mut msg, &remote_policy);
+    if let Some(view) = view {
+        let db = engine.db.lock().unwrap();
+        let _ = store::save_body_html_view(&db, account, folder, uid, &view);
+    }
     Some(msg)
 }
 
@@ -176,7 +180,7 @@ pub async fn read_cached_or_fetch(
 
     let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     let mut message = engine
-        .with_read_session(account, |session| {
+        .with_transfer_session(account, INLINE_BODY_BUDGET, |session| {
             let account = account.to_string();
             let folder = folder.to_string();
             let media_root = media_root.clone();
@@ -197,17 +201,36 @@ pub async fn read_cached_or_fetch(
         let _ = store::save_cached_message(&db, account, folder, uid, &message);
     }
 
-    attach_html(&mut message, &remote_policy);
+    let view = attach_html(&mut message, &remote_policy);
+    if let Some(view) = view {
+        let db = engine.db.lock().unwrap();
+        let _ = store::save_body_html_view(&db, account, folder, uid, &view);
+    }
     Ok(message)
 }
+
+/// How long an on-demand body download may run once the socket has answered.
+/// Inside the desktop bridge's 30s budget, and long enough that a slow server
+/// is not abandoned and fetched a second time.
+pub const INLINE_BODY_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Turn the stored HTML source into the iframe-ready `body_html` the reader's HTML
 /// mode renders: inject the remote-image CSP, allowed when the account loads
 /// remote content or the user allowed this message's sender. Plain messages have
 /// no HTML source, so this is a no-op for them.
-pub fn attach_html(message: &mut parse::Message, policy: &store::RemoteImagePolicy) {
+///
+/// Returns a view to persist when this call had to sanitize. A stored view only
+/// needs the CSP, which depends on the policy at read time.
+pub fn attach_html(
+    message: &mut parse::Message,
+    policy: &store::RemoteImagePolicy,
+) -> Option<String> {
     let allowed = policy.allows(&message.from_addr);
-    if let Some(html) = message.body_html.take() {
-        message.body_html = Some(parse::prepare_html(&html, allowed));
-    }
+    let stored = message.body_html_view.is_some();
+    let view = message
+        .body_html_view
+        .take()
+        .or_else(|| message.body_html.as_deref().map(parse::prepare_html_view))?;
+    message.body_html = Some(parse::apply_remote_image_csp(&view, allowed));
+    (!stored).then_some(view)
 }

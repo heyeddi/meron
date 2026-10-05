@@ -1941,10 +1941,14 @@ pub async fn fetch_full_message(
     Ok(message)
 }
 
+/// How many messages one `UID FETCH` pulls. One round trip per message dominates
+/// when the bodies themselves are small; a short batch still bounds how long a
+/// caller holds the connection before an interactive read can use it.
+const BODY_FETCH_BATCH: usize = 4;
+
 /// Select `folder` and fetch full bodies for `uids`, parsing each into a
-/// `Message`. Used by the mobile thread reader, which (unlike desktop) does not
-/// warm bodies during sync, so opening a thread fetches its bodies on demand.
-/// `peek` so reading doesn't flip server-side `\Seen`.
+/// `Message`. Used by the thread reader and the body prefetcher. `peek` so
+/// reading doesn't flip server-side `\Seen`.
 pub async fn fetch_bodies(
     session: &mut Session,
     folder: &str,
@@ -1954,25 +1958,49 @@ pub async fn fetch_bodies(
 ) -> Result<Vec<(u32, parse::Message)>> {
     session.select(folder).await.context("SELECT")?;
     let mut out = Vec::new();
-    for &uid in uids {
-        let media = parse::MediaCtx {
-            root: media_root.clone(),
-            account: account.to_string(),
-            folder: folder.to_string(),
-            uid,
-        };
-        if let Some(message) = fetch_full_message(session, uid, &media, true).await? {
-            out.push((uid, message));
+    for chunk in uids.chunks(BODY_FETCH_BATCH) {
+        if chunk.is_empty() {
+            continue;
         }
+        let set = chunk
+            .iter()
+            .map(|uid| uid.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stream = session
+            .uid_fetch(set, "(UID INTERNALDATE BODY.PEEK[])")
+            .await
+            .context("UID FETCH")?;
+        while let Some(item) = stream.next().await {
+            let fetch = item.context("UID FETCH item")?;
+            let Some(uid) = fetch.uid else { continue };
+            let Some(body) = fetch.body() else { continue };
+            let media = parse::MediaCtx {
+                root: media_root.clone(),
+                account: account.to_string(),
+                folder: folder.to_string(),
+                uid,
+            };
+            let mut parsed = parse::parse_message(body, Some(&media));
+            parsed.date = message_date(parsed.date, &fetch);
+            out.push((uid, parsed));
+        }
+        drop(stream);
     }
     Ok(out)
 }
 
-/// UIDs worth prefetching full bodies for in `folder`: messages that are both
-/// unread *and* received within the last `days` days. The two criteria are ANDed
-/// (IMAP SEARCH semantics). Uses server-side SEARCH so the set isn't limited to
-/// the recent-envelope window and doesn't depend on locally-parsed date strings.
-/// Selects the folder.
+/// IMAP SEARCH key for the body prefetcher: unread mail of any age, plus every
+/// message received since `since` (`dd-Mon-yyyy`). The two keys are OR'd;
+/// `UNSEEN SINCE` alone would AND them and leave already-read recent mail cold,
+/// so opening it always waited on a full download.
+pub fn prefetch_search_criteria(since: &str) -> String {
+    format!("OR UNSEEN SINCE {since}")
+}
+
+/// UIDs worth prefetching full bodies for in `folder`. Uses server-side SEARCH
+/// so the set isn't limited to the recent-envelope window and doesn't depend on
+/// locally-parsed date strings. Selects the folder.
 pub async fn search_prefetch_uids(
     session: &mut Session,
     folder: &str,
@@ -1980,10 +2008,11 @@ pub async fn search_prefetch_uids(
 ) -> Result<Vec<u32>> {
     session.select(folder).await.context("SELECT")?;
     let since = imap_date_days_ago(days);
+    let criteria = prefetch_search_criteria(&since);
     let set: HashSet<u32> = session
-        .uid_search(format!("UNSEEN SINCE {since}"))
+        .uid_search(&criteria)
         .await
-        .context("UID SEARCH UNSEEN SINCE")?;
+        .with_context(|| format!("UID SEARCH {criteria}"))?;
     let mut uids: Vec<u32> = set.into_iter().collect();
     uids.sort_unstable();
     Ok(uids)
@@ -2331,9 +2360,17 @@ mod tests {
     use super::{
         MIN_PROTOCOL_TIMEOUT, attachment_files, civil_from_days, fetch_items, first_message_id,
         header_fields, imap_quote, interleave_address_families, looks_like_drafts,
-        message_id_search_criteria, normalize_message_id, protocol_timeout_for, search_criteria,
-        thread_key, uid_set_chunks,
+        message_id_search_criteria, normalize_message_id, prefetch_search_criteria,
+        protocol_timeout_for, search_criteria, thread_key, uid_set_chunks,
     };
+
+    #[test]
+    fn prefetch_search_includes_recent_read_mail() {
+        assert_eq!(
+            prefetch_search_criteria("01-Oct-2026"),
+            "OR UNSEEN SINCE 01-Oct-2026"
+        );
+    }
 
     #[test]
     fn bodystructure_attachments_include_unopened_nested_files() {
