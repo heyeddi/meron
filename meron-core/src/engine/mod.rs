@@ -79,6 +79,12 @@ pub struct Engine {
     /// `account|thread_key`, so re-opening a thread while its missing bodies
     /// are still downloading doesn't spawn a duplicate IMAP fetch run.
     pub body_fetches: std::sync::Mutex<HashSet<String>>,
+    /// Messages (`account|folder|uid`) whose attachment files were still
+    /// missing after a refetch. A download that did not bring the files back
+    /// is not asked for again in this run, or an open thread would refetch,
+    /// notify and re-read without end. Cleared for a message once its files
+    /// are on disk.
+    pub media_recovery_failed: std::sync::Mutex<HashSet<String>>,
     /// Pulsed when an account is paused so live IDLE watchers wake and re-check
     /// their paused state (and stop) instead of blocking up to the IDLE timeout.
     pub pause_signal: Notify,
@@ -213,6 +219,11 @@ pub const MAX_IDLE: Duration = Duration::from_secs(120);
 /// still answer within the bridge budget. Write ops are exempt: cutting off a
 /// slow but progressing APPEND/SEND mid-command is worse than waiting.
 pub const POOLED_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn transfer_timed_out(budget: Duration) -> anyhow::Error {
+    anyhow::anyhow!("IMAP transfer timed out after {}s", budget.as_secs())
+}
+
 /// Do not let a wedged fresh handshake make every later operation wait for the
 /// per-account connection coordinator indefinitely. Normal startup handshakes
 /// serialize; after this, availability wins and the caller connects independently.
@@ -250,6 +261,7 @@ impl Engine {
             syncing: std::sync::Mutex::new(HashSet::new()),
             gap_attempts: std::sync::Mutex::new(HashMap::new()),
             body_fetches: std::sync::Mutex::new(HashSet::new()),
+            media_recovery_failed: std::sync::Mutex::new(HashSet::new()),
             pause_signal: Notify::new(),
             resume_signal: Notify::new(),
             pool: std::sync::Mutex::new(HashMap::new()),
@@ -608,6 +620,10 @@ impl Engine {
     /// download itself gets `budget`. Wrapping the FETCH in the short timeout
     /// aborts a slow-but-alive transfer and starts it over, which is how a
     /// large or high-latency message ends up taking twice as long to appear.
+    ///
+    /// Like [`with_read_session`](Self::with_read_session), a pooled session
+    /// that fails is replaced by a fresh one and `f` runs once more. Running
+    /// out of `budget` is not retried: the transfer was alive, only slow.
     pub async fn with_transfer_session<T, F>(
         &self,
         account: &str,
@@ -618,17 +634,12 @@ impl Engine {
         F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
         T: Send,
     {
-        if let Some(mut session) = self.take_pooled(account) {
-            let probe = tokio::time::timeout(POOLED_READ_TIMEOUT, session.noop()).await;
-            match probe {
-                Ok(Ok(())) => {
-                    return self.finish_transfer(account, budget, session, &mut f).await;
-                }
-                Ok(Err(_)) | Err(_) => {
-                    pool_debug(account, "stale-retry");
-                    drop(session);
-                }
-            }
+        if let Some(session) = self.take_pooled(account)
+            && let Some(result) = self
+                .transfer_on_pooled(account, budget, session, &mut f)
+                .await
+        {
+            return result;
         }
 
         pool_debug(account, "fresh-connect");
@@ -637,13 +648,23 @@ impl Engine {
             tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
                 .await
                 .ok();
-        if let Some(mut session) = self.take_pooled(account) {
+        if connect_guard.is_none() {
+            crate::mlog!(
+                crate::log::Level::Warn,
+                "net",
+                "fresh-connect coordination timed out for {account}; connecting independently"
+            );
+        }
+        // The task ahead of us may have completed its operation and returned the
+        // session while we waited for its handshake coordinator.
+        if let Some(session) = self.take_pooled(account) {
             drop(connect_guard.take());
-            let probe = tokio::time::timeout(POOLED_READ_TIMEOUT, session.noop()).await;
-            if matches!(probe, Ok(Ok(()))) {
-                return self.finish_transfer(account, budget, session, &mut f).await;
+            if let Some(result) = self
+                .transfer_on_pooled(account, budget, session, &mut f)
+                .await
+            {
+                return result;
             }
-            drop(session);
             connect_guard =
                 tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
                     .await
@@ -651,7 +672,7 @@ impl Engine {
         }
         let creds = self.ensure_valid_creds(account).await?;
         let connect_started = std::time::Instant::now();
-        let session = imap::connect(&creds).await?;
+        let mut session = imap::connect(&creds).await?;
         let connect_ms = connect_started.elapsed().as_millis();
         if connect_ms > 2_000 {
             crate::mlog!(
@@ -661,20 +682,6 @@ impl Engine {
             );
         }
         drop(connect_guard);
-        self.finish_transfer(account, budget, session, &mut f).await
-    }
-
-    async fn finish_transfer<T, F>(
-        &self,
-        account: &str,
-        budget: Duration,
-        mut session: imap::Session,
-        f: &mut F,
-    ) -> anyhow::Result<T>
-    where
-        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
-        T: Send,
-    {
         match tokio::time::timeout(budget, f(&mut session)).await {
             Ok(Ok(val)) => {
                 self.return_pooled(account, session);
@@ -683,7 +690,41 @@ impl Engine {
             // A failed or timed-out transfer leaves the socket mid-command.
             // Drop it instead of returning it to the pool.
             Ok(Err(err)) => Err(err),
-            Err(_) => anyhow::bail!("IMAP transfer timed out after {}s", budget.as_secs()),
+            Err(_) => Err(transfer_timed_out(budget)),
+        }
+    }
+
+    /// Run a transfer on a pooled session. `None` means the session was stale
+    /// (it was dropped) and the caller should connect fresh and run `f` again.
+    async fn transfer_on_pooled<T, F>(
+        &self,
+        account: &str,
+        budget: Duration,
+        mut session: imap::Session,
+        f: &mut F,
+    ) -> Option<anyhow::Result<T>>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        let probe = tokio::time::timeout(POOLED_READ_TIMEOUT, session.noop()).await;
+        if !matches!(probe, Ok(Ok(()))) {
+            pool_debug(account, "stale-retry");
+            return None;
+        }
+        match tokio::time::timeout(budget, f(&mut session)).await {
+            Ok(Ok(val)) => {
+                pool_debug(account, "reuse");
+                self.return_pooled(account, session);
+                Some(Ok(val))
+            }
+            // The socket answered the probe and then failed: it may have died
+            // in between, which a fresh connection gets past.
+            Ok(Err(_)) => {
+                pool_debug(account, "stale-retry");
+                None
+            }
+            Err(_) => Some(Err(transfer_timed_out(budget))),
         }
     }
 

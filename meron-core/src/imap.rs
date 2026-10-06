@@ -1944,7 +1944,7 @@ pub async fn fetch_full_message(
 /// How many messages one `UID FETCH` pulls. One round trip per message dominates
 /// when the bodies themselves are small; a short batch still bounds how long a
 /// caller holds the connection before an interactive read can use it.
-const BODY_FETCH_BATCH: usize = 4;
+pub const BODY_FETCH_BATCH: usize = 4;
 
 /// Select `folder` and fetch full bodies for `uids`, parsing each into a
 /// `Message`. Used by the thread reader and the body prefetcher. `peek` so
@@ -1990,12 +1990,13 @@ pub async fn fetch_bodies(
     Ok(out)
 }
 
-/// IMAP SEARCH key for the body prefetcher: unread mail of any age, plus every
-/// message received since `since` (`dd-Mon-yyyy`). The two keys are OR'd;
-/// `UNSEEN SINCE` alone would AND them and leave already-read recent mail cold,
-/// so opening it always waited on a full download.
+/// IMAP SEARCH key for the body prefetcher: every message received since
+/// `since` (`dd-Mon-yyyy`), read or not. `UNSEEN SINCE` left already-read recent
+/// mail cold, so opening it always waited on a full download. Older unread mail
+/// stays with the on-demand reader: a mailbox can hold years of it, attachments
+/// included.
 pub fn prefetch_search_criteria(since: &str) -> String {
-    format!("OR UNSEEN SINCE {since}")
+    format!("SINCE {since}")
 }
 
 /// UIDs worth prefetching full bodies for in `folder`. Uses server-side SEARCH
@@ -2366,10 +2367,7 @@ mod tests {
 
     #[test]
     fn prefetch_search_includes_recent_read_mail() {
-        assert_eq!(
-            prefetch_search_criteria("01-Oct-2026"),
-            "OR UNSEEN SINCE 01-Oct-2026"
-        );
+        assert_eq!(prefetch_search_criteria("01-Oct-2026"), "SINCE 01-Oct-2026");
     }
 
     #[test]

@@ -998,10 +998,6 @@ pub fn get_cached_message(
     let message_id = extra["message_id"].as_str().unwrap_or_default().to_string();
     let references = extra["references"].as_str().unwrap_or_default().to_string();
     let body_html = extra["body_html"].as_str().map(str::to_string);
-    let body_html_view = (extra["body_html_view_version"].as_i64()
-        == Some(crate::parse::HTML_VIEW_VERSION))
-    .then(|| extra["body_html_view"].as_str().map(str::to_string))
-    .flatten();
 
     // `body` is the canonical plain-text body. For legacy HTML-only rows where it
     // is missing, fall back to rendering the stored HTML source once.
@@ -1042,7 +1038,6 @@ pub fn get_cached_message(
         date,
         body,
         body_html,
-        body_html_view,
         body_is_rendered: extra["body_is_rendered"].as_bool().unwrap_or(false),
         preview: String::new(),
         attachments,
@@ -1124,8 +1119,6 @@ pub fn save_cached_message(
         "references": message.references,
         "delivered": message.delivered,
         "body_html": message.body_html,
-        "body_html_view": message.body_html_view,
-        "body_html_view_version": message.body_html_view.as_ref().map(|_| crate::parse::HTML_VIEW_VERSION),
         "body_is_rendered": message.body_is_rendered,
         "attachments": attachments_json,
     })
@@ -1162,27 +1155,5 @@ pub fn save_cached_message(
         ],
     )?;
 
-    Ok(())
-}
-
-/// Remember a sanitized HTML view so the next open stamps a CSP instead of
-/// sanitizing the source again.
-pub fn save_body_html_view(
-    conn: &Connection,
-    account: &str,
-    folder: &str,
-    uid: u32,
-    view: &str,
-) -> Result<()> {
-    let patch = serde_json::json!({
-        "body_html_view": view,
-        "body_html_view_version": crate::parse::HTML_VIEW_VERSION,
-    })
-    .to_string();
-    conn.execute(
-        "UPDATE messages SET json = json_patch(json, ?4)
-         WHERE account = ?1 AND folder = ?2 AND uid = ?3",
-        params![account, folder, uid, patch],
-    )?;
     Ok(())
 }

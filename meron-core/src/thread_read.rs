@@ -194,8 +194,16 @@ pub async fn read_thread_page(
             // Do not start background work for this independent print snapshot.
             let result = tokio::time::timeout(std::time::Duration::from_secs(20), async {
                 for &idx in &missing {
-                    fetch_into_slots(engine, account, &headers, &mut slots, &[idx], &media_root)
-                        .await?;
+                    fetch_into_slots(
+                        engine,
+                        account,
+                        &headers,
+                        &mut slots,
+                        &[idx],
+                        &media_root,
+                        crate::engine::INLINE_BODY_BUDGET,
+                    )
+                    .await?;
                 }
                 anyhow::Ok(())
             })
@@ -212,8 +220,22 @@ pub async fn read_thread_page(
             // be present — a reply built off a body-less copy has no
             // Message-ID and would orphan the thread on the recipient's side.
             // Fetch all gaps before answering.
-            if let Err(err) =
-                fetch_into_slots(engine, account, &headers, &mut slots, &missing, &media_root).await
+            //
+            // One download for the lot, so the budget grows with the count:
+            // the bodies are only saved once all of them have arrived, and a
+            // single-message allowance would discard a long thread every time.
+            let budget = (crate::engine::INLINE_BODY_BUDGET * missing.len() as u32)
+                .min(BACKGROUND_BODY_BUDGET);
+            if let Err(err) = fetch_into_slots(
+                engine,
+                account,
+                &headers,
+                &mut slots,
+                &missing,
+                &media_root,
+                budget,
+            )
+            .await
             {
                 // Degrade to the stale cached bodies when every message still
                 // has one (e.g. a local draft with no Message-ID that a
@@ -243,6 +265,7 @@ pub async fn read_thread_page(
                 &mut slots,
                 &[newest],
                 &media_root,
+                crate::engine::INLINE_BODY_BUDGET,
             )
             .await
             {
@@ -265,7 +288,13 @@ pub async fn read_thread_page(
                 .map(|&idx| (slots[idx].folder.clone(), headers[idx].uid))
                 .collect();
             // Bodies we can already show, whose attachment bytes are gone.
-            for item in messages_missing_media(&slots, &headers, &media_root) {
+            for item in messages_missing_media(
+                &engine.media_recovery_failed.lock().unwrap(),
+                account,
+                &slots,
+                &headers,
+                &media_root,
+            ) {
                 if !background.contains(&item) {
                     background.push(item);
                 }
@@ -285,7 +314,13 @@ pub async fn read_thread_page(
         // Every body is cached, but a cleared attachment cache still leaves
         // keys pointing at files that are gone. Refetch those without holding
         // the body the UI already has.
-        let background = messages_missing_media(&slots, &headers, &media_root);
+        let background = messages_missing_media(
+            &engine.media_recovery_failed.lock().unwrap(),
+            account,
+            &slots,
+            &headers,
+            &media_root,
+        );
         if !background.is_empty() {
             spawn_fill_thread_bodies(
                 engine,
@@ -308,13 +343,10 @@ pub async fn read_thread_page(
     };
     let mut seen_message_ids = HashSet::new();
     let mut messages = Vec::with_capacity(headers.len());
-    let mut views_to_store = Vec::new();
     for (header, slot) in headers.iter().zip(slots) {
         let mut cached = slot.cached;
-        if let Some(message) = cached.as_mut()
-            && let Some(view) = attach_html(message, &remote_policy)
-        {
-            views_to_store.push((slot.folder.clone(), header.uid, view));
+        if let Some(message) = cached.as_mut() {
+            attach_html(message, &remote_policy);
         }
         // Newly synced envelope rows do not have json.message_id yet, so the
         // SQL-level cross-folder dedupe cannot collapse a self-addressed
@@ -327,7 +359,7 @@ pub async fn read_thread_page(
         if !message_id_key.is_empty() && !seen_message_ids.insert(message_id_key) {
             continue;
         }
-        messages.push(thread_message_json(
+        let mut message = thread_message_json(
             account,
             thread_id,
             &slot.folder,
@@ -335,13 +367,28 @@ pub async fn read_thread_page(
             cached.as_ref(),
             &mine,
             &ours,
-        ));
-    }
-    if !views_to_store.is_empty() {
-        let db = engine.db.lock().unwrap();
-        for (folder, uid, view) in views_to_store {
-            let _ = store::save_body_html_view(&db, account, &folder, uid, &view);
+        );
+        // A paged read answers before pruned attachment files are back. The
+        // body and its `/media` URLs are the same before and after, so this is
+        // what tells a client its pictures are worth asking for again. A count,
+        // not a flag: a recovery that restores one file and not another still
+        // has to show.
+        let media_missing = cached.as_ref().map_or(0, |cached| {
+            cached
+                .attachments
+                .iter()
+                .filter(|attachment| {
+                    !attachment
+                        .key
+                        .as_deref()
+                        .is_some_and(|key| media_root.join(key).is_file())
+                })
+                .count()
+        });
+        if media_missing > 0 {
+            message["media_missing"] = json!(media_missing);
         }
+        messages.push(message);
     }
 
     let mut out = json!({ "messages": messages });
@@ -353,8 +400,15 @@ pub async fn read_thread_page(
     Ok(out)
 }
 
-/// Cached messages whose attachment files are no longer on disk.
+/// Cached messages whose attachment files are not on disk: pruned, never
+/// written, or cached before their keys were kept.
+///
+/// A message is left out once a refetch has failed to bring its files back
+/// (see `Engine::media_recovery_failed`), so the reader is not notified and
+/// asked again for as long as the thread stays open.
 fn messages_missing_media(
+    gave_up: &HashSet<String>,
+    account: &str,
     slots: &[Slot],
     headers: &[imap::MessageHeader],
     media_root: &std::path::Path,
@@ -370,7 +424,12 @@ fn messages_missing_media(
                     .is_some_and(|message| !parse::cached_media_available(media_root, message))
         })
         .map(|(idx, slot)| (slot.folder.clone(), headers[idx].uid))
+        .filter(|(folder, uid)| !gave_up.contains(&media_recovery_key(account, folder, *uid)))
         .collect()
+}
+
+fn media_recovery_key(account: &str, folder: &str, uid: u32) -> String {
+    format!("{account}|{folder}|{uid}")
 }
 
 fn thread_cursor(header: &imap::MessageHeader) -> String {
@@ -401,6 +460,10 @@ fn thread_cursor_position(
     })
 }
 
+/// How long a download nobody is waiting on may run: the background fill, and
+/// the ceiling for a full-scan read of a long thread.
+const BACKGROUND_BODY_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Fetch the bodies for `indices` from IMAP (grouped by folder so each mailbox
 /// is SELECTed once), cache them, and mark their slots complete.
 async fn fetch_into_slots(
@@ -410,6 +473,7 @@ async fn fetch_into_slots(
     slots: &mut [Slot],
     indices: &[usize],
     media_root: &std::path::Path,
+    budget: std::time::Duration,
 ) -> anyhow::Result<()> {
     let _snapshot_guard = MessageSyncGuard::begin(engine)?;
     let mut by_folder: BTreeMap<String, Vec<u32>> = BTreeMap::new();
@@ -424,7 +488,7 @@ async fn fetch_into_slots(
         account,
         &by_folder,
         media_root.to_path_buf(),
-        crate::engine::INLINE_BODY_BUDGET,
+        budget,
     )
     .await?;
     let db = engine.db.lock().unwrap();
@@ -489,9 +553,10 @@ fn spawn_fill_thread_bodies(
     let account = account.to_string();
     tokio::spawn(async move {
         let mut by_folder: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-        for (folder, uid) in missing {
-            by_folder.entry(folder).or_default().push(uid);
+        for (folder, uid) in &missing {
+            by_folder.entry(folder.clone()).or_default().push(*uid);
         }
+        let recovery_root = media_root.clone();
         let mut fetched_any = false;
         let fetch = async {
             let guard = MessageSyncGuard::begin(&engine)?;
@@ -500,7 +565,7 @@ fn spawn_fill_thread_bodies(
                 &account,
                 &by_folder,
                 media_root,
-                std::time::Duration::from_secs(120),
+                BACKGROUND_BODY_BUDGET,
             )
             .await?;
             anyhow::Ok((guard, fetched))
@@ -508,11 +573,30 @@ fn spawn_fill_thread_bodies(
         .await;
         match fetch {
             Ok((_guard, fetched)) => {
-                let db = engine.db.lock().unwrap();
-                for (folder, uid, message) in fetched {
-                    let _ = store::save_cached_message(&db, &account, &folder, uid, &message);
-                    fetched_any = true;
+                // Asked for and still without its files (or gone from the
+                // server): this download was the attempt.
+                let mut gave_up: HashSet<String> = missing
+                    .iter()
+                    .map(|(folder, uid)| media_recovery_key(&account, folder, *uid))
+                    .collect();
+                {
+                    let db = engine.db.lock().unwrap();
+                    for (folder, uid, message) in &fetched {
+                        let _ = store::save_cached_message(&db, &account, folder, *uid, message);
+                        fetched_any = true;
+                        if parse::cached_media_available(&recovery_root, message) {
+                            gave_up.remove(&media_recovery_key(&account, folder, *uid));
+                        }
+                    }
                 }
+                let mut failed = engine.media_recovery_failed.lock().unwrap();
+                for (folder, uid) in &missing {
+                    let key = media_recovery_key(&account, folder, *uid);
+                    if !gave_up.contains(&key) {
+                        failed.remove(&key);
+                    }
+                }
+                failed.extend(gave_up);
             }
             Err(err) => {
                 crate::mlog!(
@@ -616,8 +700,12 @@ pub fn thread_message_json(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_thread_cursor, thread_cursor, thread_cursor_position, thread_message_json};
+    use super::{
+        Slot, media_recovery_key, messages_missing_media, parse_thread_cursor, thread_cursor,
+        thread_cursor_position, thread_message_json,
+    };
     use crate::imap::MessageHeader;
+    use crate::parse::{Attachment, Message};
     use std::collections::HashSet;
 
     fn header(uid: u32, seen: bool) -> MessageHeader {
@@ -628,6 +716,50 @@ mod tests {
             seen,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn media_recovery_covers_keyless_files_until_a_refetch_fails() {
+        let root =
+            std::env::temp_dir().join(format!("meron-media-recovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("acc/INBOX/3")).unwrap();
+        std::fs::write(root.join("acc/INBOX/3/0.png"), [1]).unwrap();
+        let slot = |key: Option<&str>| {
+            let mut message = Message::default();
+            message.attachments.push(Attachment {
+                filename: "a.png".to_string(),
+                mime: "image/png".to_string(),
+                size: 1,
+                key: key.map(str::to_string),
+            });
+            Slot {
+                folder: "INBOX".to_string(),
+                cached: Some(message),
+                complete: true,
+            }
+        };
+        // Pruned, never written, and present.
+        let slots = [
+            slot(Some("acc/INBOX/1/0.png")),
+            slot(None),
+            slot(Some("acc/INBOX/3/0.png")),
+        ];
+        let headers = [header(1, true), header(2, true), header(3, true)];
+
+        let mut gave_up = HashSet::new();
+        assert_eq!(
+            messages_missing_media(&gave_up, "acc", &slots, &headers, &root),
+            vec![("INBOX".to_string(), 1), ("INBOX".to_string(), 2)]
+        );
+
+        // A refetch that did not bring uid 2's file back is not repeated.
+        gave_up.insert(media_recovery_key("acc", "INBOX", 2));
+        assert_eq!(
+            messages_missing_media(&gave_up, "acc", &slots, &headers, &root),
+            vec![("INBOX".to_string(), 1)]
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

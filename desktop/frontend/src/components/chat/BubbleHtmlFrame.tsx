@@ -4,7 +4,13 @@ import { useTranslation } from '../../lib/i18n'
 import { copyText } from '../../lib/native'
 import { Gallery, type GalleryItem } from './Gallery'
 import { HtmlFrame } from './HtmlFrame'
-import { FRAME_GENERATION_MARKER, applyBubbleTheme, prepareBubbleHtml, reserveImageBoxes } from './bubbleHtml'
+import {
+  FRAME_GENERATION_MARKER,
+  applyBubbleTheme,
+  prepareBubbleHtml,
+  reloadFailedImages,
+  reserveImageBoxes,
+} from './bubbleHtml'
 import { bodyContentKey } from './messageHelpers'
 import { applyFrameHighlights, clearFrameHighlights } from './frameSearchHighlight'
 import { MIN_FRAME_HEIGHT, frameMetrics, measureFrameHeight } from './frameHeight'
@@ -30,6 +36,7 @@ export function BubbleHtmlFrame({
   html,
   outgoing = false,
   allowRemote = false,
+  mediaMissing = 0,
   searchQuery = '',
   activeSearchOffset = -1,
   onLinkHover,
@@ -41,6 +48,8 @@ export function BubbleHtmlFrame({
   outgoing?: boolean
   /** Loosen the baked CSP so this message's remote content loads. */
   allowRemote?: boolean
+  /** How many attachment files this message refers to are not on disk yet. */
+  mediaMissing?: number
   /** In-thread search query; matches are marked inside the frame document. */
   searchQuery?: string
   /** Which of this frame's matches the search is parked on, -1 for none. */
@@ -87,11 +96,13 @@ export function BubbleHtmlFrame({
   const cacheKey = `${documentKey}:${bubbleTheme.appearance}`
   const cachedHeight = measuredHeights.get(cacheKey)
   const [height, setHeight] = useState(() => cachedHeight ?? DEFAULT_FRAME_HEIGHT)
-  const [measured, setMeasured] = useState(() => cachedHeight !== undefined)
   const [nearViewport, setNearViewport] = useState(() => typeof IntersectionObserver === 'undefined')
   const hostRef = useRef<HTMLDivElement | null>(null)
   const heightRef = useRef(height)
-  const measuredRef = useRef(measured)
+  const measuredRef = useRef(cachedHeight !== undefined)
+  // The document `height` was measured for, so a new one starts from the
+  // placeholder and a measurement that beat the effect below is kept.
+  const heightKeyRef = useRef(cachedHeight !== undefined ? documentKey : null)
   const [frameDoc, setFrameDoc] = useState<Document | null>(null)
   // The ready handler is keyed on the document, not on the theme; the effect
   // below repaints a live frame when the theme changes under it.
@@ -154,15 +165,14 @@ export function BubbleHtmlFrame({
     if (cached !== undefined) {
       heightRef.current = cached
       measuredRef.current = true
+      heightKeyRef.current = documentKey
       setHeight(cached)
-      setMeasured(true)
       return
     }
-    if (heightRef.current > DEFAULT_FRAME_HEIGHT) return
+    if (heightKeyRef.current === documentKey) return
     heightRef.current = DEFAULT_FRAME_HEIGHT
     measuredRef.current = false
     setHeight(DEFAULT_FRAME_HEIGHT)
-    setMeasured(false)
   }, [documentKey])
 
   useEffect(() => {
@@ -216,7 +226,7 @@ export function BubbleHtmlFrame({
         measuredHeights.set(`${documentKey}:${appearanceRef.current}`, nextHeight)
         heightRef.current = nextHeight
         measuredRef.current = true
-        setMeasured(true)
+        heightKeyRef.current = documentKey
         setHeight(nextHeight)
       }
       publish(measureFrameHeight(frameMetrics(doc)).height)
@@ -249,10 +259,8 @@ export function BubbleHtmlFrame({
           // Filed under the document this handler was installed for, in whatever
           // appearance is painting it now: a later document has its own handler.
           measuredHeights.set(`${documentKey}:${appearanceRef.current}`, nextHeight)
-          if (!measuredRef.current) {
-            measuredRef.current = true
-            setMeasured(true)
-          }
+          measuredRef.current = true
+          heightKeyRef.current = documentKey
           if (Math.abs(nextHeight - heightRef.current) < HEIGHT_CHANGE_EPSILON) return
           heightRef.current = nextHeight
           setHeight(nextHeight)
@@ -435,6 +443,20 @@ export function BubbleHtmlFrame({
   useEffect(() => {
     if (frameDoc?.body) applyBubbleTheme(frameDoc, bubbleTheme)
   }, [frameDoc, bubbleTheme])
+
+  // A body can be shown before its attachment files are back on disk. When they
+  // arrive the HTML is the same, so the frame keeps its document — and a picture
+  // that already failed stays broken unless it is asked for again. Any drop in
+  // the count is a file that came back, whether or not the rest followed.
+  const mediaMissingRef = useRef(mediaMissing)
+  const mediaRestoredRef = useRef(false)
+  useEffect(() => {
+    if (mediaMissing < mediaMissingRef.current) mediaRestoredRef.current = true
+    mediaMissingRef.current = mediaMissing
+    if (!mediaRestoredRef.current || !frameDoc) return
+    mediaRestoredRef.current = false
+    reloadFailedImages(frameDoc)
+  }, [mediaMissing, frameDoc])
 
   // Mark search hits in the live document. Re-runs when the query, the active
   // match, or the document itself changes; clearing on teardown keeps a frame

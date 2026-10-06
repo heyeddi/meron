@@ -155,11 +155,7 @@ pub fn read_cached(
     if msg.message_id.is_empty() || !parse::cached_media_available(&media_root, &msg) {
         return None;
     }
-    let view = attach_html(&mut msg, &remote_policy);
-    if let Some(view) = view {
-        let db = engine.db.lock().unwrap();
-        let _ = store::save_body_html_view(&db, account, folder, uid, &view);
-    }
+    attach_html(&mut msg, &remote_policy);
     Some(msg)
 }
 
@@ -201,11 +197,7 @@ pub async fn read_cached_or_fetch(
         let _ = store::save_cached_message(&db, account, folder, uid, &message);
     }
 
-    let view = attach_html(&mut message, &remote_policy);
-    if let Some(view) = view {
-        let db = engine.db.lock().unwrap();
-        let _ = store::save_body_html_view(&db, account, folder, uid, &view);
-    }
+    attach_html(&mut message, &remote_policy);
     Ok(message)
 }
 
@@ -218,22 +210,13 @@ pub const INLINE_BODY_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// mode renders: inject the remote-image CSP, allowed when the account loads
 /// remote content or the user allowed this message's sender. Plain messages have
 /// no HTML source, so this is a no-op for them.
-///
-/// Returns a view to persist when this call had to sanitize. A stored view only
-/// needs the CSP, which depends on the policy at read time.
-pub fn attach_html(
-    message: &mut parse::Message,
-    policy: &store::RemoteImagePolicy,
-) -> Option<String> {
+pub fn attach_html(message: &mut parse::Message, policy: &store::RemoteImagePolicy) {
     let allowed = policy.allows(&message.from_addr);
-    let stored = message.body_html_view.is_some();
-    let subject = message.subject.clone();
-    let view = message.body_html_view.take().or_else(|| {
-        message
-            .body_html
-            .as_deref()
-            .map(|html| parse::prepare_html_view(html, &subject))
-    })?;
-    message.body_html = Some(parse::apply_remote_image_csp(&view, allowed));
-    (!stored).then_some(view)
+    if let Some(html) = message.body_html.take() {
+        message.body_html = Some(parse::prepare_message_html(
+            &html,
+            allowed,
+            &message.subject,
+        ));
+    }
 }

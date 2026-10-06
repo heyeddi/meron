@@ -1,6 +1,6 @@
 import { BUBBLE_CODE_BASE_PX, BUBBLE_HTML_BASE_PX, type MessageFrameFont } from '../../lib/fonts'
 import { QUOTE_FOLDED_CLASS, QUOTE_TOGGLE_CLASS } from './quoteFold'
-import { allowRemoteInCsp, blockRemoteInCsp } from './remoteContentCsp'
+import { allowRemoteContent, allowRemoteInCsp, blockRemoteContent, blockRemoteInCsp } from './remoteContentCsp'
 import {
   DARKENED_ATTR,
   DARKENED_CSS,
@@ -8,6 +8,7 @@ import {
   LIGHT_ON_DARK_TEXT,
   colorTone,
   darkensCanvas,
+  disownStyleElements,
   frameCanvas,
   frameVar,
   frameVarPrefix,
@@ -34,7 +35,26 @@ export function reserveImageBoxes(doc: Document) {
     const width = plainLength(el.getAttribute('width'))
     const height = plainLength(el.getAttribute('height'))
     if (width === null || height === null) continue
-    el.style.aspectRatio = `${width} / ${height}`
+    // `auto`: once the picture has loaded its own proportions win, as they do
+    // without this. The attributes of a stretched or mislabelled picture only
+    // hold its place until then.
+    el.style.aspectRatio = `auto ${width} / ${height}`
+  }
+}
+
+/**
+ * Ask again for every picture in `doc` whose request already failed.
+ *
+ * The attribute is dropped and put back, not assigned its own value: the URL is
+ * the same one that failed, and an unchanged `src` is not a reason to load.
+ */
+export function reloadFailedImages(doc: Document) {
+  for (const image of doc.querySelectorAll<HTMLImageElement>('img[src]')) {
+    if (!image.complete || image.naturalWidth > 0) continue
+    const src = image.getAttribute('src')
+    if (!src) continue
+    image.removeAttribute('src')
+    image.setAttribute('src', src)
   }
 }
 
@@ -51,10 +71,25 @@ const DEFAULT_MESSAGE_FRAME_FONT: MessageFrameFont = {
 
 const SIZING_STYLE = 'height: auto !important; min-height: 0 !important'
 
-// An empty document, only so the frame stylesheet can be built. The message
-// itself is never parsed here: WebKit parses it once, as the iframe's srcdoc.
+// An empty document, only so the frame's own tags can be built. A message from
+// the core is never parsed here: WebKit parses it once, as the iframe's srcdoc.
 function emptyDocument(): Document {
   return document.implementation?.createHTMLDocument?.('') ?? new DOMParser().parseFromString('', 'text/html')
+}
+
+// The shell the core wraps every sanitized message in (`inject_head` in
+// meron-core's parse.rs). A document that opens with exactly this has its real
+// head right here, whatever the message goes on to contain — so this is where
+// the frame's CSP goes. Nothing is ever looked for inside the message: `<html>`
+// or `<head>` can be spelled in its `<style>` text or an attribute value, and a
+// CSP spliced in there is one the browser never reads.
+const CORE_SHELL_OPEN = '<!doctype html><html><head>'
+const CORE_BODY_OPEN = '</head><body>'
+
+const FRAME_STYLE_ATTR = /\sdata-meron-frame-style(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]*))?/gi
+
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 }
 
 function endOfTag(html: string, start: number): number {
@@ -74,71 +109,6 @@ function endOfTag(html: string, start: number): number {
   return -1
 }
 
-function findOpenTag(html: string, name: string): { start: number; end: number; attrs: string } | null {
-  const lower = html.toLowerCase()
-  const needle = `<${name}`
-  let from = 0
-  while (from < html.length) {
-    const comment = lower.indexOf('<!--', from)
-    const at = lower.indexOf(needle, from)
-    if (at < 0) return null
-    if (comment !== -1 && comment < at) {
-      const close = lower.indexOf('-->', comment + 4)
-      from = close < 0 ? html.length : close + 3
-      continue
-    }
-    const next = lower[at + needle.length]
-    if (next && /[a-z0-9]/.test(next)) {
-      from = at + needle.length
-      continue
-    }
-    const end = endOfTag(html, at)
-    if (end < 0) return null
-    return { start: at, end, attrs: html.slice(at + needle.length, end - 1) }
-  }
-  return null
-}
-
-function findCloseTag(html: string, name: string): number {
-  const lower = html.toLowerCase()
-  const needle = `</${name}`
-  let from = 0
-  while (from < html.length) {
-    const at = lower.indexOf(needle, from)
-    if (at < 0) return -1
-    const next = lower[at + needle.length]
-    if (!next || next === '>' || /\s/.test(next)) return at
-    from = at + needle.length
-  }
-  return -1
-}
-
-function replaceOpenTag(html: string, name: string, tag: { start: number; end: number }, attrs: string): string {
-  const rawName = html.slice(tag.start + 1, tag.start + 1 + name.length)
-  return `${html.slice(0, tag.start)}<${rawName}${attrs}>${html.slice(tag.end)}`
-}
-
-function escapeAttr(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
-}
-
-function withGeneration(attrs: string, generation: string): string {
-  const without = attrs.replace(/\sdata-meron-generation\s*=\s*(?:"[^"]*"|'[^']*')/i, '')
-  return `${without} ${FRAME_GENERATION_MARKER}="${escapeAttr(generation)}"`
-}
-
-function withSizing(attrs: string): string {
-  const match = attrs.match(/\sstyle\s*=\s*(["'])([\s\S]*?)\1/i)
-  if (!match) return `${attrs} style="${SIZING_STYLE}"`
-  const value = match[2]
-    .replace(/(?:^|;)\s*min-height\s*:[^;]*/gi, '')
-    .replace(/(?:^|;)\s*height\s*:[^;]*/gi, '')
-    .replace(/^\s*;+\s*|\s*;+\s*$/g, '')
-    .trim()
-  const next = value ? `${value}; ${SIZING_STYLE}` : SIZING_STYLE
-  return attrs.replace(match[0], ` style=${match[1]}${next}${match[1]}`)
-}
-
 function rewriteCspMetas(html: string, rewrite: (csp: string) => string): string {
   const lower = html.toLowerCase()
   let out = ''
@@ -146,12 +116,6 @@ function rewriteCspMetas(html: string, rewrite: (csp: string) => string): string
   while (from < html.length) {
     const at = lower.indexOf('<meta', from)
     if (at < 0) return out + html.slice(from)
-    const next = lower[at + 5]
-    if (next && /[a-z0-9]/.test(next)) {
-      out += html.slice(from, at + 5)
-      from = at + 5
-      continue
-    }
     const end = endOfTag(html, at)
     if (end < 0) return out + html.slice(from)
     out += html.slice(from, at) + rewriteCspMeta(html.slice(at, end), rewrite)
@@ -167,50 +131,32 @@ function rewriteCspMeta(tag: string, rewrite: (csp: string) => string): string {
   })
 }
 
-// A fragment, or a document missing head or body, still has to carry the frame
-// markup on the elements the iframe parser will use.
-function ensureDocument(html: string): string {
-  if (!findOpenTag(html, 'html')) {
-    return `<!doctype html><html><head></head><body>${html}</body></html>`
-  }
-  let out = html
-  if (!findOpenTag(out, 'head')) {
-    const htmlTag = findOpenTag(out, 'html')!
-    out = `${out.slice(0, htmlTag.end)}<head></head>${out.slice(htmlTag.end)}`
-  }
-  if (findCloseTag(out, 'head') < 0) {
-    const body = findOpenTag(out, 'body')
-    const at = body ? body.start : out.length
-    out = `${out.slice(0, at)}</head>${out.slice(at)}`
-  }
-  if (!findOpenTag(out, 'body')) {
-    const afterHead = findCloseTag(out, 'head') + '</head>'.length
-    const htmlClose = findCloseTag(out, 'html')
-    const end = htmlClose < 0 ? out.length : htmlClose
-    out = `${out.slice(0, afterHead)}<body>${out.slice(afterHead, end)}</body>${out.slice(end)}`
-  }
-  return out
-}
-
-function assembleBubbleDocument(
+// The frame's tags spliced into a document from the core, so the iframe's parse
+// is the only one. Null for anything else, which is parsed and rebuilt instead.
+//
+// No doctype is written back: the parsed path serialises the root element
+// alone, and a message must lay out the same whichever path prepared it.
+function assembleCoreDocument(
   html: string,
   csp: string,
   style: string,
   allowRemote: boolean,
   generation: string,
-): string {
-  const rewrite = allowRemote ? allowRemoteInCsp : blockRemoteInCsp
-  let out = ensureDocument(
-    rewriteCspMetas(html.replace(/\sdata-meron-frame-style\s*=\s*(?:"[^"]*"|'[^']*')/gi, ''), rewrite),
+): string | null {
+  if (!html.startsWith(CORE_SHELL_OPEN)) return null
+  const rest = html.slice(CORE_SHELL_OPEN.length)
+  const bodyAt = rest.indexOf(CORE_BODY_OPEN)
+  if (bodyAt < 0) return null
+  // The head is the core's own: its baked CSP is the one to bring in line with
+  // the caller's decision. The frame's CSP goes ahead of it and blocks on its
+  // own, so a rewrite that misses can only keep pictures hidden.
+  const head = rewriteCspMetas(rest.slice(0, bodyAt), allowRemote ? allowRemoteInCsp : blockRemoteInCsp)
+  // Anything that arrived claiming to be a frame stylesheet isn't one.
+  const body = rest.slice(bodyAt + CORE_BODY_OPEN.length).replace(FRAME_STYLE_ATTR, '')
+  return (
+    `<html ${FRAME_GENERATION_MARKER}="${escapeAttr(generation)}" style="${SIZING_STYLE}">` +
+    `<head>${csp}${head}${style}</head><body style="${SIZING_STYLE}">${body}`
   )
-  const htmlTag = findOpenTag(out, 'html')!
-  out = replaceOpenTag(out, 'html', htmlTag, withSizing(withGeneration(htmlTag.attrs, generation)))
-  const bodyTag = findOpenTag(out, 'body')!
-  out = replaceOpenTag(out, 'body', bodyTag, withSizing(bodyTag.attrs))
-  const headClose = findCloseTag(out, 'head')
-  out = `${out.slice(0, headClose)}${style}${out.slice(headClose)}`
-  const headTag = findOpenTag(out, 'head')!
-  return `${out.slice(0, headTag.end)}${csp}${out.slice(headTag.end)}`
 }
 
 // Sanitises and styles an email's HTML body before it's rendered inside the
@@ -230,10 +176,11 @@ export function prepareBubbleHtml(
   generation = '',
 ) {
   try {
-    // Build the frame's own tags on an empty document. Parsing the message
-    // here and serialising it back made WebKit parse every newsletter twice
-    // before the iframe could paint.
-    const doc = emptyDocument()
+    // A document from the core gets the frame's tags built on an empty document
+    // and spliced in. Parsing it here and serialising it back made WebKit parse
+    // every newsletter twice before the iframe could paint.
+    const spliced = html.startsWith(CORE_SHELL_OPEN)
+    const doc = spliced ? emptyDocument() : new DOMParser().parseFromString(html, 'text/html')
 
     // The iframe runs with `allow-scripts` (so our link-click handler fires),
     // so we must block the email's own JS here. `default-src 'none'` denies
@@ -436,8 +383,33 @@ export function prepareBubbleHtml(
     // rules the later one wins. Inline declarations outrank every stylesheet
     // rule of the same importance, so they win wherever the reset sits — and
     // unlike an appended `<style>` they leave `:last-child` and friends alone.
-    // Spliced into the source string so the iframe's parse is the only one.
-    return assembleBubbleDocument(html, csp.outerHTML, style.outerHTML, allowRemote, generation)
+    if (spliced) {
+      const assembled = assembleCoreDocument(html, csp.outerHTML, style.outerHTML, allowRemote, generation)
+      if (assembled !== null) return assembled
+    }
+
+    const parsed = spliced ? new DOMParser().parseFromString(html, 'text/html') : doc
+    parsed.head.insertBefore(parsed.importNode(csp, true), parsed.head.firstChild)
+    // The body arrives with the sidecar's own CSP meta, baked from the policy in
+    // force when it was read. Rewrite it in place so a decision made since then
+    // takes effect without a refetch: loosen it once the user reveals this
+    // message (or allows its sender), tighten it once that trust is withdrawn.
+    if (allowRemote) allowRemoteContent(parsed)
+    else blockRemoteContent(parsed)
+    // Anything that arrived claiming to be a frame stylesheet isn't one — the
+    // marker is also where this document's variable prefix travels.
+    disownStyleElements(parsed)
+    // Which document this is. A frame is wired as soon as its srcDoc changes,
+    // while the one it replaces is still loaded, so the host checks this before
+    // it treats what it finds as the document it just asked for. Sanitising
+    // drops every `data-*` attribute, so sender markup can't carry one.
+    parsed.documentElement.setAttribute(FRAME_GENERATION_MARKER, generation)
+    parsed.head.appendChild(spliced ? parsed.importNode(style, true) : style)
+    for (const el of [parsed.documentElement, parsed.body]) {
+      el.style.setProperty('height', 'auto', 'important')
+      el.style.setProperty('min-height', '0', 'important')
+    }
+    return parsed.documentElement.outerHTML
   } catch {
     return html
   }

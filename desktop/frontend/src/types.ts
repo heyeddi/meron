@@ -164,6 +164,11 @@ export type Message = {
   /** True when the body isn't cached yet — the on-demand fetch failed or is
    * still filling in the background (a `mail.synced` re-read delivers it). */
   body_missing?: boolean
+  /** How many attachment files this message refers to are not on disk yet
+   * (absent when none): the body is shown first and a `mail.synced` re-read
+   * lowers this as they come back. The body and its `/media` URLs do not
+   * change when it does. */
+  media_missing?: number
   /** Send time as Unix epoch seconds (0 when unknown). Format via lib/date helpers. */
   date: number
   /** Sent by this account, classified by the core (own address or Sent-folder

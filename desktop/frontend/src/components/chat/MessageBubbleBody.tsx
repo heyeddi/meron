@@ -78,6 +78,7 @@ export function MessageBubbleBody({
           html={message.body_html!}
           outgoing={outgoing}
           allowRemote={allowRemote}
+          mediaMissing={message.media_missing ?? 0}
           searchQuery={normalizedSearchQuery}
           activeSearchOffset={activeSearchOffset}
           onLinkHover={onLinkHover}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { applyBubbleTheme, prepareBubbleHtml, reserveImageBoxes } from './bubbleHtml'
+import { applyBubbleTheme, prepareBubbleHtml, reloadFailedImages, reserveImageBoxes } from './bubbleHtml'
 import {
   DARKENED_ATTR,
   DEFAULT_BUBBLE_THEME,
@@ -225,7 +225,7 @@ describe('prepareBubbleHtml', () => {
       reserveImageBoxes(doc)
 
       const [hero, bar] = [...doc.querySelectorAll('img')]
-      expect(hero?.style.aspectRatio).toBe('600 / 400')
+      expect(hero?.style.aspectRatio).toBe('auto 600 / 400')
       // A percentage width is not a length the box can be built from.
       expect(bar?.style.aspectRatio).toBe('')
     })
@@ -239,6 +239,67 @@ describe('prepareBubbleHtml', () => {
       expect(marked).toHaveLength(1)
       expect(marked[0]?.getAttribute(FRAME_STYLE_MARKER)).not.toBe('stolen')
       expect(marked[0]?.textContent).toContain('overflow-wrap')
+    })
+
+    it('asks again only for pictures that failed', () => {
+      const doc = new DOMParser().parseFromString(
+        '<img id="failed" src="/media/a/1/0.png"><img id="loaded" src="/media/a/1/1.png"><img id="loading" src="/media/a/1/2.png">',
+        'text/html',
+      )
+      const state = { failed: [true, 0], loaded: [true, 40], loading: [false, 0] } as const
+      const requested: string[] = []
+      for (const image of doc.querySelectorAll('img')) {
+        const [complete, naturalWidth] = state[image.id as keyof typeof state]
+        Object.defineProperty(image, 'complete', { value: complete })
+        Object.defineProperty(image, 'naturalWidth', { value: naturalWidth })
+        const setAttribute = image.setAttribute.bind(image)
+        image.setAttribute = (name: string, value: string) => {
+          if (name === 'src') requested.push(image.id)
+          setAttribute(name, value)
+        }
+      }
+
+      reloadFailedImages(doc)
+
+      expect(requested).toEqual(['failed'])
+      expect(doc.getElementById('failed')?.getAttribute('src')).toBe('/media/a/1/0.png')
+    })
+
+    // What the core hands over: its shell, its baked CSP, then the message.
+    const coreDocument = (message: string) =>
+      `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' data:; media-src 'self' data: blob:;"></head><body>${message}</body></html>`
+
+    it('keeps its CSP first in the head of a document from the core', () => {
+      // `<style>` text and attribute values reach the frame verbatim, so a
+      // message can spell out tags the frame must not mistake for its own.
+      for (const message of [
+        '<style>/*<html><head>*/</style><img src="https://t.example/p.png">',
+        '<img alt="</head><body><html><head>" src="https://t.example/p.png">',
+      ]) {
+        const out = prepareBubbleHtml(coreDocument(message), undefined, false, 'gen-1')
+
+        expect(out.startsWith('<html data-meron-generation="gen-1" style="')).toBe(true)
+        const head = out.slice(out.indexOf('<head>') + '<head>'.length)
+        expect(head.startsWith('<meta http-equiv="Content-Security-Policy" content="default-src \'none\';')).toBe(true)
+        expect(head.indexOf("img-src 'self' data:;")).toBeLessThan(head.indexOf('</head>'))
+        expect(out).toContain(message)
+        expect(out.match(new RegExp(FRAME_STYLE_MARKER, 'g'))).toHaveLength(1)
+      }
+    })
+
+    it('brings the baked CSP of a document from the core in line with the reveal', () => {
+      const out = prepareBubbleHtml(coreDocument('<p>Hi</p>'), undefined, true)
+
+      expect(out).toContain("img-src 'self' data: http: https:;")
+      expect(out).toContain('img-src * data: blob:')
+    })
+
+    it('strips a frame stylesheet claim from a document from the core however it is quoted', () => {
+      for (const claim of ['="stolen"', "='stolen'", '=stolen', '']) {
+        const out = prepareBubbleHtml(coreDocument(`<style data-meron-frame-style${claim}>p{color:red}</style>`))
+
+        expect(out).toContain('<style>p{color:red}</style>')
+      }
     })
 
     it('stamps the generation the host asked for', () => {

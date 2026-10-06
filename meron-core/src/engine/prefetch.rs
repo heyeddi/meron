@@ -8,14 +8,19 @@ use crate::{imap, parse, store};
 
 use super::*;
 
-/// How far back the body prefetcher reaches: unread mail of any age, plus
-/// everything received within this many days.
+/// How far back the body prefetcher reaches: everything received within this
+/// many days, read or not.
 pub const PREFETCH_DAYS: u32 = 14;
 
-/// Messages downloaded per IMAP session checkout. The session goes back to the
-/// pool between batches so opening a message can reuse it instead of waiting
-/// out the rest of the backlog or paying for a new TLS handshake.
-const PREFETCH_BATCH: usize = 4;
+/// Messages downloaded per IMAP session checkout: one `UID FETCH`. The session
+/// goes back to the pool between batches so opening a message can reuse it
+/// instead of waiting out the rest of the backlog or paying for a new TLS
+/// handshake.
+const PREFETCH_BATCH: usize = imap::BODY_FETCH_BATCH;
+
+/// Downloads that may fail in a row before a run gives up. A dead connection
+/// fails every attempt; a message that cannot be downloaded fails only its own.
+const PREFETCH_MAX_FAILURES: usize = 3;
 
 /// One batch is a few full messages. Long enough for a slow server, short
 /// enough that a dead socket is not held for the whole backlog.
@@ -49,8 +54,8 @@ pub(super) fn limit_prefetch_uids(mut pending: Vec<u32>, max_count: Option<usize
 }
 
 /// Download full message bodies (RFC822, attachments included) for a folder's
-/// unread mail and its recent messages into the store, so opening them is instant
-/// and they read offline. Searches once, then fetches newest-first in short
+/// recent messages into the store, so opening them is instant and they read
+/// offline. Searches once, then fetches newest-first in short
 /// batches, returning the connection to the pool between batches. Skips messages
 /// whose body is already cached, so repeat runs converge to a cheap SEARCH; a
 /// run cut short resumes on the next trigger since saved bodies persist. Layered
@@ -90,36 +95,73 @@ pub async fn prefetch_bodies_with_options(
     let pending = limit_prefetch_uids(pending, options.max_count);
 
     let mut fetched = 0usize;
-    for chunk in pending.chunks(PREFETCH_BATCH) {
-        let chunk = chunk.to_vec();
-        let batch = engine
-            .with_transfer_session(account, PREFETCH_BATCH_BUDGET, |session| {
-                let folder = folder.to_string();
-                let account = account.to_string();
-                let chunk = chunk.clone();
-                let media_root = options.media_root.clone();
-                Box::pin(async move {
-                    // peek via fetch_bodies: warming must not flip unread mail to read.
-                    imap::fetch_bodies(session, &folder, &chunk, media_root, &account).await
-                })
-            })
-            .await;
-        match batch {
-            Ok(messages) => {
-                let db = engine.db.lock().unwrap();
-                for (uid, message) in messages {
-                    let _ = store::save_cached_message(&db, account, folder, uid, &message);
-                    fetched += 1;
-                }
+    let mut failures = 0usize;
+    'backlog: for chunk in pending.chunks(PREFETCH_BATCH) {
+        if failures >= PREFETCH_MAX_FAILURES {
+            break;
+        }
+        match prefetch_batch(engine, account, folder, chunk, &options.media_root).await {
+            Ok(saved) => {
+                fetched += saved;
+                failures = 0;
+                continue;
             }
-            // Saved batches stay cached; the next trigger continues with the rest.
             Err(e) => {
                 eprintln!("meron-core: prefetch {folder}: {e:#}");
+                failures += 1;
+            }
+        }
+        // Nothing from a failed batch is saved, and the order never changes, so
+        // one message that cannot be downloaded would fail the same batch on
+        // every run and keep everything older cold. Take the batch one message
+        // at a time, and carry on past the one that fails.
+        for uid in chunk {
+            if failures >= PREFETCH_MAX_FAILURES {
+                break 'backlog;
+            }
+            if chunk.len() == 1 {
                 break;
+            }
+            match prefetch_batch(engine, account, folder, &[*uid], &options.media_root).await {
+                Ok(saved) => {
+                    fetched += saved;
+                    failures = 0;
+                }
+                Err(e) => {
+                    eprintln!("meron-core: prefetch {folder} uid {uid}: {e:#}");
+                    failures += 1;
+                }
             }
         }
     }
     Ok(fetched)
+}
+
+/// Download and cache `uids` on one session checkout; how many were saved.
+async fn prefetch_batch(
+    engine: &Arc<Engine>,
+    account: &str,
+    folder: &str,
+    uids: &[u32],
+    media_root: &std::path::Path,
+) -> anyhow::Result<usize> {
+    let messages = engine
+        .with_transfer_session(account, PREFETCH_BATCH_BUDGET, |session| {
+            let folder = folder.to_string();
+            let account = account.to_string();
+            let uids = uids.to_vec();
+            let media_root = media_root.to_path_buf();
+            Box::pin(async move {
+                // peek via fetch_bodies: warming must not flip unread mail to read.
+                imap::fetch_bodies(session, &folder, &uids, media_root, &account).await
+            })
+        })
+        .await?;
+    let db = engine.db.lock().unwrap();
+    for (uid, message) in &messages {
+        let _ = store::save_cached_message(&db, account, folder, *uid, message);
+    }
+    Ok(messages.len())
 }
 
 /// Fetch and cache the bodies of specific UIDs, skipping any already cached.
