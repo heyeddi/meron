@@ -5,6 +5,7 @@
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use html_to_markdown_rs::{ConversionOptions, convert};
+use mailparse::body::Body;
 use mailparse::{
     DispositionType, MailAddr, MailAddrList, MailHeader, MailHeaderMap, ParsedMail, addrparse,
     addrparse_header, parse_header, parse_mail,
@@ -520,7 +521,9 @@ pub fn parse_message(raw: &[u8], media: Option<&MediaCtx>) -> Message {
         (None, None) => (String::new(), None, false),
     };
     // Sanitize once, here, so opening the message later only stamps a CSP.
-    let body_html_view = body_html.as_deref().map(prepare_html_view);
+    let body_html_view = body_html
+        .as_deref()
+        .map(|html| prepare_html_view(html, &subject));
     let preview = preview_of(&body);
 
     Message {
@@ -963,7 +966,7 @@ fn split_important(value: &str) -> (&str, bool) {
 
 /// Bump when [`prepare_html_view`] changes, so cached views are rebuilt instead
 /// of served stale. Stored next to the view in the message JSON.
-pub const HTML_VIEW_VERSION: i64 = 1;
+pub const HTML_VIEW_VERSION: i64 = 2;
 
 /// Wrap stored HTML for safe iframe rendering: inject a CSP `<meta>` that allows
 /// same-origin (`/media`), data, and blob images/media always, and remote (`https:`)
@@ -975,20 +978,31 @@ pub const HTML_VIEW_VERSION: i64 = 1;
 /// The expensive sanitize step is [`prepare_html_view`] and is cached on the
 /// message. This stamps the policy-dependent CSP onto that view.
 pub fn prepare_html(source: &str, load_remote_images: bool) -> String {
-    apply_remote_image_csp(&prepare_html_view(source), load_remote_images)
+    prepare_message_html(source, load_remote_images, "")
+}
+
+/// [`prepare_html`] for a mail with a subject, which is what tells an Outlook
+/// forward from a reply when folding the quote (see quote.rs).
+pub fn prepare_message_html(source: &str, load_remote_images: bool, subject: &str) -> String {
+    apply_remote_image_csp(&prepare_html_view(source, subject), load_remote_images)
 }
 
 /// Sanitized, quote-marked HTML with the reader's charset, canvas colors, and
 /// image sizing, and no CSP. Safe to store: the remote-image decision is applied
 /// later by [`apply_remote_image_csp`].
-pub fn prepare_html_view(source: &str) -> String {
+///
+/// `subject` tells an Outlook forward from a reply when folding the quote.
+pub fn prepare_html_view(source: &str, subject: &str) -> String {
     // Defence in depth: strip script-bearing markup *before* anything else is
     // injected, so a CSP bypass alone can't run the email's JS. CSS is kept (the
     // CSP allows `style-src 'unsafe-inline'`); only script vectors are removed.
     let raw_source = source;
     // Marked after sanitizing, which drops every sender `data-*` attribute, so
     // the quote marker the frames fold on is always ours.
-    let source = &crate::quote::mark_html_quote(&sanitize_email_html(source));
+    let source = &crate::quote::mark_html_quote(
+        &sanitize_email_html(source),
+        crate::quote::is_forward_subject(subject),
+    );
     // Keep oversized inline images within the reader width (preserving aspect), and
     // hint that they open the gallery. `style-src 'unsafe-inline'` covers this block.
     // The email's own canvas colors, hoisted off the `<body>` ammonia just
@@ -1529,7 +1543,7 @@ fn body_sources(part: &mailparse::ParsedMail) -> BodySources {
 
     let ctype = part.ctype.mimetype.to_ascii_lowercase();
     if part.subparts.is_empty() && ctype.starts_with("text/") {
-        let content = part.get_body().unwrap_or_default();
+        let content = text_body(part).unwrap_or_default();
         if content.contains("<html")
             || content.contains("<body")
             || content.contains("<p>")
@@ -1577,7 +1591,7 @@ fn plain_is_markup(plain: &str) -> bool {
 
 fn find_text_part(part: &ParsedMail, mime: &str) -> Option<String> {
     if part.ctype.mimetype.eq_ignore_ascii_case(mime) {
-        return part.get_body().ok();
+        return text_body(part);
     }
     for sub in &part.subparts {
         if let Some(body) = find_text_part(sub, mime) {
@@ -1585,6 +1599,39 @@ fn find_text_part(part: &ParsedMail, mime: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Decoded text of a leaf part. A base64 body cut off mid-quantum (a truncated
+/// message, a sender that drops the padding) fails to decode as a whole, which
+/// would leave the reader with no body at all; decode the complete quanta
+/// instead and show what did arrive.
+fn text_body(part: &ParsedMail) -> Option<String> {
+    if let Ok(body) = part.get_body() {
+        return Some(body);
+    }
+    let Body::Base64(encoded) = part.get_body_encoded() else {
+        return None;
+    };
+    let mut cleaned: Vec<u8> = encoded
+        .get_raw()
+        .iter()
+        .copied()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    cleaned.truncate(cleaned.len() / 4 * 4);
+    // Nothing complete arrived: leave the part out so an HTML alternative can
+    // stand in for it.
+    if cleaned.is_empty() {
+        return None;
+    }
+    // Re-parse as a part of its own so `mailparse` applies the charset.
+    let mut raw = format!(
+        "Content-Type: {}; charset={}\r\nContent-Transfer-Encoding: base64\r\n\r\n",
+        part.ctype.mimetype, part.ctype.charset
+    )
+    .into_bytes();
+    raw.extend_from_slice(&cleaned);
+    parse_mail(&raw).ok()?.get_body().ok()
 }
 
 /// Drop the markup that makes a body readable in the reader but noisy in a
@@ -1924,6 +1971,23 @@ mod tests {
     }
 
     #[test]
+    fn truncated_base64_body_keeps_what_decodes() {
+        // "hello world" is `aGVsbG8gd29ybGQ=`; cut mid-quantum it no longer
+        // decodes as a whole.
+        let raw = b"From: a@b.com\r\nSubject: x\r\nContent-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\naGVsbG8gd29y\r\nbGQ\r\n--b--\r\n";
+        let msg = parse_message(raw, None);
+        assert_eq!(msg.body, "hello wor");
+    }
+
+    #[test]
+    fn undecodable_base64_plain_part_falls_back_to_html() {
+        let raw = b"From: a@b.com\r\nSubject: x\r\nContent-Type: multipart/alternative; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\naG\r\n--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>hello world</p>\r\n--b--\r\n";
+        let msg = parse_message(raw, None);
+        assert!(msg.body_is_rendered);
+        assert_eq!(msg.body, "hello world");
+    }
+
+    #[test]
     fn plain_text_keeps_no_html_source() {
         let raw = b"From: a@b.com\r\nSubject: x\r\nContent-Type: text/plain\r\n\r\nhello world";
         let msg = parse_message(raw, None);
@@ -2209,7 +2273,7 @@ AQID\r\n\
     #[test]
     fn prepare_html_view_skips_sanitize_when_the_csp_changes() {
         let source = "<p style=\"color:red\" onclick=\"steal()\">hi</p>";
-        let view = prepare_html_view(source);
+        let view = prepare_html_view(source, "");
         assert!(!view.contains("Content-Security-Policy"), "{view}");
         assert!(!view.contains("onclick"), "{view}");
         assert!(view.contains("color:red"), "{view}");

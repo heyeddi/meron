@@ -13,7 +13,10 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeout
+import kotlin.concurrent.Volatile
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -398,10 +401,20 @@ class KanbanColumnLoadOrderTest {
     ) : MeronCore {
         val actionGate = CompletableDeferred<Unit>()
         val actionGates = mutableMapOf<String, CompletableDeferred<Unit>>()
+
+        // Commands arrive on the IO dispatcher, two at once when actions
+        // overlap, while the test polls the counts from its own thread.
+        private val bookkeeping = Mutex()
         val actionRequests = mutableListOf<Pair<String, String>>()
+
+        @Volatile
         var actionCalls = 0
+
+        @Volatile
         private var actionsCompleted = false
         val gate = CompletableDeferred<Unit>()
+
+        @Volatile
         var threadListCalls = 0
 
         override suspend fun invoke(
@@ -414,10 +427,14 @@ class KanbanColumnLoadOrderTest {
                 }
 
                 MobileCommand.ThreadList -> {
-                    threadListCalls += 1
+                    val call =
+                        bookkeeping.withLock {
+                            threadListCalls += 1
+                            threadListCalls
+                        }
                     if (emptyAfterActions && actionsCompleted) {
                         """{"threads":[]}"""
-                    } else if (threadListCalls == 1) {
+                    } else if (call == 1) {
                         gate.await()
                         card(messageCount = 3, hasDraft = true)
                     } else {
@@ -426,8 +443,10 @@ class KanbanColumnLoadOrderTest {
                 }
 
                 MobileCommand.Archive, MobileCommand.Delete, MobileCommand.Move, MobileCommand.EmptyFolder -> {
-                    actionRequests.add(command to payloadJson)
-                    actionCalls += 1
+                    bookkeeping.withLock {
+                        actionRequests.add(command to payloadJson)
+                        actionCalls += 1
+                    }
                     val gate = actionGates[command]
                     if (gate != null) {
                         gate.await()

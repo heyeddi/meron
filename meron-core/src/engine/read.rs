@@ -227,10 +227,13 @@ pub fn attach_html(
 ) -> Option<String> {
     let allowed = policy.allows(&message.from_addr);
     let stored = message.body_html_view.is_some();
-    let view = message
-        .body_html_view
-        .take()
-        .or_else(|| message.body_html.as_deref().map(parse::prepare_html_view))?;
+    let subject = message.subject.clone();
+    let view = message.body_html_view.take().or_else(|| {
+        message
+            .body_html
+            .as_deref()
+            .map(|html| parse::prepare_html_view(html, &subject))
+    })?;
     message.body_html = Some(parse::apply_remote_image_csp(&view, allowed));
     (!stored).then_some(view)
 }

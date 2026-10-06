@@ -47,6 +47,7 @@ import androidx.compose.material.icons.filled.RssFeed
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.UnfoldMore
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.AlertDialog
@@ -152,6 +153,8 @@ internal fun SettingsScreen(
     onToggleSenderImages: () -> Unit,
     darkMailBodies: Boolean,
     onToggleDarkMailBodies: () -> Unit,
+    chatFullMessages: Boolean,
+    onToggleChatFullMessages: () -> Unit,
     autoFitMessages: Boolean,
     onToggleAutoFitMessages: () -> Unit,
     readerBottomActions: Boolean,
@@ -371,6 +374,8 @@ internal fun SettingsScreen(
                     onOpenMessageTextSize = { showMessageTextSize = true },
                     darkMailBodies = darkMailBodies,
                     onToggleDarkMailBodies = onToggleDarkMailBodies,
+                    chatFullMessages = chatFullMessages,
+                    onToggleChatFullMessages = onToggleChatFullMessages,
                     autoFitMessages = autoFitMessages,
                     onToggleAutoFitMessages = onToggleAutoFitMessages,
                     readerBottomActions = readerBottomActions,
@@ -1009,6 +1014,8 @@ internal fun SettingsMessagesPage(
     onOpenMessageTextSize: () -> Unit,
     darkMailBodies: Boolean,
     onToggleDarkMailBodies: () -> Unit,
+    chatFullMessages: Boolean,
+    onToggleChatFullMessages: () -> Unit,
     autoFitMessages: Boolean,
     onToggleAutoFitMessages: () -> Unit,
     readerBottomActions: Boolean,
@@ -1028,6 +1035,17 @@ internal fun SettingsMessagesPage(
                 onClick = onToggleConversationLayout,
                 trailing = { Text(conversationLayout.label(), color = MaterialTheme.colorScheme.primary) },
             )
+        }
+        if (conversationLayout == ConversationLayout.Chat) {
+            item {
+                SettingsToggleRow(
+                    icon = Icons.Filled.UnfoldMore,
+                    title = tr("settings.appearance.chatFullMessages"),
+                    hint = tr("settings.appearance.chatFullMessagesHint"),
+                    checked = chatFullMessages,
+                    onToggle = onToggleChatFullMessages,
+                )
+            }
         }
         item {
             SettingsRow(

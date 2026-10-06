@@ -157,6 +157,13 @@ jobs:
           extra=""
           if [[ "${{ matrix.os }}" == windows* ]]; then extra="-nsis"; fi
           cd desktop
+          if [[ "${{ matrix.os }}" == ubuntu* ]]; then
+            # Wails claims org.wails_app_<id>.SingleInstance, which the Snap
+            # Store holds for manual review. Claim the app ID itself instead:
+            # the snap declaration already grants jp.nonbili.meron.
+            go mod vendor
+            patch -p1 < build/linux/wails-single-instance-dbus-name.patch
+          fi
           wails build -clean -platform ${{ matrix.platform }} -tags "${{ matrix.tags }}" $extra
 
       - name: package macOS dmg

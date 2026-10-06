@@ -46,7 +46,6 @@ apps:
     desktop: usr/share/applications/meron.desktop
     slots:
       - meron
-      - single-instance
     plugs:
       - home
       - network
@@ -65,12 +64,10 @@ apps:
       - audio-playback
 
 slots:
+  # Owned by the single-instance lock. The release build patches Wails to claim
+  # the app ID (desktop/build/linux/wails-single-instance-dbus-name.patch)
+  # because the store's snap declaration grants this name only.
   meron:
     interface: dbus
     bus: session
     name: jp.nonbili.meron
-  # Wails derives this name from appUniqueID(), rather than using the app ID.
-  single-instance:
-    interface: dbus
-    bus: session
-    name: org.wails_app_jp_nonbili_meron.SingleInstance

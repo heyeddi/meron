@@ -161,12 +161,16 @@ pub async fn read_thread_page(
                 // always carries a Message-ID, so emptiness is a reliable
                 // "pre-extraction cache" signal.
                 //
-                // Missing attachment files do not block the body. A pruned
-                // image used to force a full RFC822 download before the text
-                // could paint; that download now runs in the background.
-                let complete = cached
-                    .as_ref()
-                    .is_some_and(|message| !message.message_id.is_empty());
+                // A paged UI read paints the body without waiting on pruned
+                // attachment files; those are filled in the background. A
+                // full-scan read (no limit, including print) still treats
+                // missing files as incomplete, so the caller has the bytes
+                // before the call returns.
+                let wait_for_media = limit.is_none() || for_print;
+                let complete = cached.as_ref().is_some_and(|message| {
+                    !message.message_id.is_empty()
+                        && (!wait_for_media || parse::cached_media_available(&media_root, message))
+                });
                 Slot {
                     folder: msg_folder,
                     cached,
@@ -261,15 +265,7 @@ pub async fn read_thread_page(
                 .map(|&idx| (slots[idx].folder.clone(), headers[idx].uid))
                 .collect();
             // Bodies we can already show, whose attachment bytes are gone.
-            for (idx, slot) in slots.iter().enumerate() {
-                let needs_media = slot.complete
-                    && slot.cached.as_ref().is_some_and(|message| {
-                        !parse::cached_media_available(&media_root, message)
-                    });
-                if !needs_media {
-                    continue;
-                }
-                let item = (slot.folder.clone(), headers[idx].uid);
+            for item in messages_missing_media(&slots, &headers, &media_root) {
                 if !background.contains(&item) {
                     background.push(item);
                 }
@@ -284,6 +280,21 @@ pub async fn read_thread_page(
                     on_bodies_fetched,
                 );
             }
+        }
+    } else if limit.is_some() && !for_print {
+        // Every body is cached, but a cleared attachment cache still leaves
+        // keys pointing at files that are gone. Refetch those without holding
+        // the body the UI already has.
+        let background = messages_missing_media(&slots, &headers, &media_root);
+        if !background.is_empty() {
+            spawn_fill_thread_bodies(
+                engine,
+                account,
+                thread_key,
+                background,
+                media_root.clone(),
+                on_bodies_fetched,
+            );
         }
     }
 
@@ -340,6 +351,26 @@ pub async fn read_thread_page(
             .insert("next_cursor".into(), Value::String(cursor));
     }
     Ok(out)
+}
+
+/// Cached messages whose attachment files are no longer on disk.
+fn messages_missing_media(
+    slots: &[Slot],
+    headers: &[imap::MessageHeader],
+    media_root: &std::path::Path,
+) -> Vec<(String, u32)> {
+    slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slot)| {
+            slot.complete
+                && slot
+                    .cached
+                    .as_ref()
+                    .is_some_and(|message| !parse::cached_media_available(media_root, message))
+        })
+        .map(|(idx, slot)| (slot.folder.clone(), headers[idx].uid))
+        .collect()
 }
 
 fn thread_cursor(header: &imap::MessageHeader) -> String {

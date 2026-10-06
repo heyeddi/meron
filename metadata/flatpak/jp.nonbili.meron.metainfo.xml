@@ -63,6 +63,19 @@
   <content_rating type="oars-1.1" />
 
   <releases>
+    <release version="0.4.2" date="2026-10-05">
+      <description>
+        <ul>
+          <li>Export threads, selections and folders as .eml</li>
+          <li>Option to show full message content in chat</li>
+          <li>Scale composer text with message text size</li>
+          <li>Slide tasks and details panels open and closed</li>
+          <li>Simplify task dragging and inline editing</li>
+          <li>Conceal startup window until the UI is rendered</li>
+          <li>Fold Outlook quotes</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.4.1" date="2026-10-03">
       <description>
         <ul>

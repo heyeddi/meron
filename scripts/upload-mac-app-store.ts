@@ -14,7 +14,6 @@
 import { resolve } from 'node:path'
 import {
   commandExists,
-  copyFile,
   ensureFile,
   envFlag,
   fail,
@@ -22,6 +21,7 @@ import {
   repoRoot,
   requireEnv,
   run,
+  writeAppleReleaseNotes,
 } from '../mobile/scripts/release-utils'
 
 const [pkgArg] = Bun.argv.slice(2)
@@ -86,7 +86,7 @@ if (!(await commandExists('bundle'))) {
 // the GitHub release note is built from.
 const source = resolve(repoRoot, `metadata/changelogs/v${version}.txt`)
 await ensureFile(source, `Changelog not found: ${source}`)
-await copyFile(source, releaseNotesPath)
+await writeAppleReleaseNotes(source, releaseNotesPath)
 console.log(`Using release notes from ${source}`)
 
 if (!skipBuild) {

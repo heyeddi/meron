@@ -146,6 +146,10 @@ internal const val DARK_MAIL_BODIES_PREF = "dark_mail_bodies_v1"
  *  full-screen reader always does. Off by default. */
 internal const val AUTO_FIT_MESSAGES_PREF = "auto_fit_messages_v1"
 
+/** Whether chat bubbles grow to fit long bodies instead of scrolling inside a
+ *  capped box, so only the conversation scrolls. Off by default. */
+internal const val CHAT_FULL_MESSAGES_PREF = "chat_full_messages_v1"
+
 /** Whether the message reader puts reply, forward and delete in a bottom bar
  *  where they are easier to reach, instead of only in the top overflow menu. */
 internal const val READER_BOTTOM_ACTIONS_PREF = "reader_bottom_actions_v1"

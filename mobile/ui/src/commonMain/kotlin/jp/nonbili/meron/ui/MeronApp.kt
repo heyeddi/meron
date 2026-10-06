@@ -327,6 +327,7 @@ fun MeronApp(
             messageFontScale = state.messageFontScale,
             darkMailBodies = state.darkMailBodies,
             autoFitMessages = state.autoFitMessages,
+            chatFullMessages = state.chatFullMessages,
         ) {
             MeronMobileScreenContent(
                 state = state,
@@ -1328,6 +1329,11 @@ private fun MeronMobileScreenContent(
                     onToggleDarkMailBodies = {
                         darkMailBodies = !darkMailBodies
                         saveAppBoolean(prefs, DARK_MAIL_BODIES_PREF, darkMailBodies)
+                    },
+                    chatFullMessages = chatFullMessages,
+                    onToggleChatFullMessages = {
+                        chatFullMessages = !chatFullMessages
+                        saveAppBoolean(prefs, CHAT_FULL_MESSAGES_PREF, chatFullMessages)
                     },
                     autoFitMessages = autoFitMessages,
                     onToggleAutoFitMessages = {

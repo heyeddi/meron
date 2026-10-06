@@ -8,15 +8,27 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.UIKitView
+import kotlinx.cinterop.BetaInteropApi
 import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.ObjCAction
+import kotlinx.cinterop.useContents
+import platform.CoreGraphics.CGPointMake
 import platform.CoreGraphics.CGRectMake
 import platform.Foundation.NSNumber
+import platform.Foundation.NSSelectorFromString
+import platform.UIKit.UIGestureRecognizer
+import platform.UIKit.UIGestureRecognizerDelegateProtocol
+import platform.UIKit.UIGestureRecognizerStateBegan
+import platform.UIKit.UIGestureRecognizerStateChanged
+import platform.UIKit.UIPanGestureRecognizer
+import platform.UIKit.UIScrollView
 import platform.WebKit.WKScriptMessage
 import platform.WebKit.WKScriptMessageHandlerProtocol
 import platform.WebKit.WKUserContentController
 import platform.WebKit.WKWebView
 import platform.WebKit.WKWebViewConfiguration
 import platform.darwin.NSObject
+import kotlin.math.abs
 
 @OptIn(ExperimentalForeignApi::class)
 @Composable
@@ -48,6 +60,9 @@ actual fun MailWebView(
     // recomposition (every height report recomposes), and reloading the same
     // page would reset what the reader did in it — an opened quote, for one.
     val loadedHtml = remember { LoadedHtml() }
+    // Held here because a gesture recognizer retains neither its target nor
+    // its delegate.
+    val zoomedPan = remember { ZoomedPanHandler() }
     UIKitView(
         modifier = modifier,
         factory = {
@@ -82,8 +97,16 @@ actual fun MailWebView(
             WKWebView(frame = CGRectMake(0.0, 0.0, 0.0, 0.0), configuration = config).apply {
                 // Compose owns capped bubble scrolling; the web view is measured
                 // to its full content height so its native scroll view would fight
-                // the parent LazyColumn for vertical drags.
+                // the parent LazyColumn for vertical drags. Its pinch is a
+                // separate recognizer and stays on, so the page still zooms; the
+                // sideways pan a zoomed page then needs is ZoomedPanHandler's.
                 scrollView.scrollEnabled = false
+                addGestureRecognizer(
+                    UIPanGestureRecognizer(target = zoomedPan, action = NSSelectorFromString("handlePan:")).apply {
+                        maximumNumberOfTouches = 1u
+                        delegate = zoomedPan
+                    },
+                )
                 setOpaque(false)
             }
         },
@@ -99,6 +122,49 @@ actual fun MailWebView(
 private class LoadedHtml(
     var value: String? = null,
 )
+
+/** Pans a page zoomed wider than the view sideways, in place of the scroll
+ *  view's own pan (off, see the factory above). It begins only for a drag the
+ *  page can follow, so a vertical drag, or one past the page's edge, is left to
+ *  the list or reader scrolling around the web view. */
+@OptIn(ExperimentalForeignApi::class)
+private class ZoomedPanHandler :
+    NSObject(),
+    UIGestureRecognizerDelegateProtocol {
+    private var startOffsetX = 0.0
+
+    override fun gestureRecognizerShouldBegin(gestureRecognizer: UIGestureRecognizer): Boolean {
+        val pan = gestureRecognizer as? UIPanGestureRecognizer ?: return false
+        val scrollView = pan.scrollView() ?: return false
+        val (vx, vy) = pan.velocityInView(pan.view).useContents { x to y }
+        if (abs(vx) <= abs(vy)) return false
+        val offsetX = scrollView.contentOffset.useContents { x }
+        // A finger moving right brings in what lies to the left.
+        return if (vx > 0) offsetX > 0.5 else offsetX < scrollView.maxOffsetX() - 0.5
+    }
+
+    @OptIn(BetaInteropApi::class)
+    @ObjCAction
+    fun handlePan(pan: UIPanGestureRecognizer) {
+        val scrollView = pan.scrollView() ?: return
+        when (pan.state) {
+            UIGestureRecognizerStateBegan -> {
+                startOffsetX = scrollView.contentOffset.useContents { x }
+            }
+
+            UIGestureRecognizerStateChanged -> {
+                val dx = pan.translationInView(pan.view).useContents { x }
+                val x = (startOffsetX - dx).coerceIn(0.0, scrollView.maxOffsetX().coerceAtLeast(0.0))
+                val y = scrollView.contentOffset.useContents { y }
+                scrollView.setContentOffset(CGPointMake(x, y), animated = false)
+            }
+        }
+    }
+
+    private fun UIPanGestureRecognizer.scrollView(): UIScrollView? = (view as? WKWebView)?.scrollView
+
+    private fun UIScrollView.maxOffsetX(): Double = contentSize.useContents { width } - bounds.useContents { size.width }
+}
 
 private class QuoteMessageHandler(
     private val onToggle: (Boolean) -> Unit,
@@ -169,4 +235,4 @@ internal actual val MailWebViewFollowsSystemFontScale: Boolean = false
 // WKWebView has no shrink-to-fit counterpart (see fitWideContent above).
 internal actual val MailWebViewFitsWideContent: Boolean = false
 
-internal actual val MailWebViewPinchZooms: Boolean = false
+internal actual val MailWebViewPinchZooms: Boolean = true

@@ -440,6 +440,10 @@ val LocalDarkMailBodies = staticCompositionLocalOf { false }
  *  MailWebView's `fitWideContent`). */
 val LocalAutoFitMessages = staticCompositionLocalOf { false }
 
+/** Whether chat bubbles grow to fit long bodies instead of scrolling inside a
+ *  capped box (see MessageBubble). */
+val LocalChatFullMessages = staticCompositionLocalOf { false }
+
 /** The handful of colors a theme swatch paints, mirroring desktop's ThemeSwatch. */
 internal data class ThemePreviewColors(
     val dark: Boolean,
@@ -478,6 +482,7 @@ fun MeronTheme(
     messageFontScale: Int = DEFAULT_MESSAGE_FONT_SCALE,
     darkMailBodies: Boolean = false,
     autoFitMessages: Boolean = false,
+    chatFullMessages: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val resolved = resolveThemeSpec(appearanceMode)
@@ -488,6 +493,7 @@ fun MeronTheme(
         LocalMessageFontScale provides messageFontScale,
         LocalDarkMailBodies provides (darkMailBodies && spec.dark),
         LocalAutoFitMessages provides autoFitMessages,
+        LocalChatFullMessages provides chatFullMessages,
     ) {
         MaterialTheme(colorScheme = resolved.scheme ?: materialColors(spec), content = content)
     }

@@ -7,7 +7,17 @@
 	objects = {
 
 /* Begin PBXAggregateTarget section */
-        B2000000000000000000003C /* MeronLocalization */ = {isa = PBXAggregateTarget; buildConfigurationList = B20000000000000000000040; buildPhases = (A10000000000000000000062, ); dependencies = (); name = MeronLocalization; productName = MeronLocalization; };
+		B2000000000000000000003C /* MeronLocalization */ = {
+			isa = PBXAggregateTarget;
+			buildConfigurationList = B20000000000000000000040 /* Build configuration list for PBXAggregateTarget "MeronLocalization" */;
+			buildPhases = (
+				A10000000000000000000062 /* Generate i18n */,
+			);
+			dependencies = (
+			);
+			name = MeronLocalization;
+			productName = MeronLocalization;
+		};
 /* End PBXAggregateTarget section */
 
 /* Begin PBXBuildFile section */
@@ -15,7 +25,6 @@
 		A10000000000000000000003 /* RustCoreBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* RustCoreBridge.swift */; };
 		A10000000000000000000004 /* IosBackgroundRefresh.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000016 /* IosBackgroundRefresh.swift */; };
 		A10000000000000000000005 /* IosAppPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000017 /* IosAppPaths.swift */; };
-		A10000000000000000000210 /* IosSyncDiagnosticLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000211 /* IosSyncDiagnosticLog.swift */; };
 		A10000000000000000000006 /* RustCoreBridgeContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000018 /* RustCoreBridgeContractTests.swift */; };
 		A10000000000000000000008 /* IosNotificationContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001B /* IosNotificationContractTests.swift */; };
 		A10000000000000000000009 /* OAuthCallbackContractTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000001C /* OAuthCallbackContractTests.swift */; };
@@ -27,13 +36,14 @@
 		A1000000000000000000011B /* IosComposeHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000011C /* IosComposeHost.swift */; };
 		A10000000000000000000201 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000200 /* Assets.xcassets */; };
 		A10000000000000000000203 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000202 /* LaunchScreen.storyboard */; };
-		B2000000000000000000000B = {isa = PBXBuildFile; fileRef = B20000000000000000000001; };
-		B2000000000000000000000C = {isa = PBXBuildFile; fileRef = B20000000000000000000002; };
-		B2000000000000000000000D = {isa = PBXBuildFile; fileRef = B20000000000000000000001; };
-		B2000000000000000000000E = {isa = PBXBuildFile; fileRef = B20000000000000000000003; };
-		B2000000000000000000000F = {isa = PBXBuildFile; fileRef = B20000000000000000000006; };
-		B20000000000000000000011 = {isa = PBXBuildFile; fileRef = B20000000000000000000008 /* Widget Localizable.xcstrings */; };
-		B20000000000000000000012 = {isa = PBXBuildFile; fileRef = B20000000000000000000007; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		A10000000000000000000210 /* IosSyncDiagnosticLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000211 /* IosSyncDiagnosticLog.swift */; };
+		B2000000000000000000000B /* UnreadWidgetSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* UnreadWidgetSnapshot.swift */; };
+		B2000000000000000000000C /* IosUnreadWidgets.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000002 /* IosUnreadWidgets.swift */; };
+		B2000000000000000000000D /* UnreadWidgetSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000001 /* UnreadWidgetSnapshot.swift */; };
+		B2000000000000000000000E /* MeronWidgets.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000003 /* MeronWidgets.swift */; };
+		B2000000000000000000000F /* IosUnreadWidgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000006 /* IosUnreadWidgetTests.swift */; };
+		B20000000000000000000011 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000008 /* Localizable.xcstrings */; };
+		B20000000000000000000012 /* MeronWidgets.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = B20000000000000000000007 /* MeronWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -44,12 +54,34 @@
 			remoteGlobalIDString = A10000000000000000000040;
 			remoteInfo = Meron;
 		};
-		B2000000000000000000002A = {isa = PBXContainerItemProxy; containerPortal = A10000000000000000000041; proxyType = 1; remoteGlobalIDString = B20000000000000000000028; remoteInfo = MeronWidgets; };
-        B2000000000000000000003E = {isa = PBXContainerItemProxy; containerPortal = A10000000000000000000041; proxyType = 1; remoteGlobalIDString = B2000000000000000000003C; remoteInfo = MeronLocalization; };
+		B2000000000000000000002A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000041 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B20000000000000000000028;
+			remoteInfo = MeronWidgets;
+		};
+		B2000000000000000000003E /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000041 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = B2000000000000000000003C;
+			remoteInfo = MeronLocalization;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
-		B20000000000000000000021 = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 13; files = (B20000000000000000000012, ); name = "Embed App Extensions"; runOnlyForDeploymentPostprocessing = 0; };
+		B20000000000000000000021 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				B20000000000000000000012 /* MeronWidgets.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
@@ -62,7 +94,6 @@
 		A10000000000000000000015 /* Meron-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Meron-Bridging-Header.h"; sourceTree = "<group>"; };
 		A10000000000000000000016 /* IosBackgroundRefresh.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosBackgroundRefresh.swift; sourceTree = "<group>"; };
 		A10000000000000000000017 /* IosAppPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosAppPaths.swift; sourceTree = "<group>"; };
-		A10000000000000000000211 /* IosSyncDiagnosticLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosSyncDiagnosticLog.swift; sourceTree = "<group>"; };
 		A10000000000000000000018 /* RustCoreBridgeContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RustCoreBridgeContractTests.swift; sourceTree = "<group>"; };
 		A10000000000000000000019 /* MeronTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MeronTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1000000000000000000001B /* IosNotificationContractTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosNotificationContractTests.swift; sourceTree = "<group>"; };
@@ -75,6 +106,7 @@
 		A1000000000000000000011C /* IosComposeHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosComposeHost.swift; sourceTree = "<group>"; };
 		A10000000000000000000200 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A10000000000000000000202 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		A10000000000000000000211 /* IosSyncDiagnosticLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosSyncDiagnosticLog.swift; sourceTree = "<group>"; };
 		B20000000000000000000001 /* UnreadWidgetSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnreadWidgetSnapshot.swift; sourceTree = "<group>"; };
 		B20000000000000000000002 /* IosUnreadWidgets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosUnreadWidgets.swift; sourceTree = "<group>"; };
 		B20000000000000000000003 /* MeronWidgets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeronWidgets.swift; sourceTree = "<group>"; };
@@ -82,7 +114,7 @@
 		B20000000000000000000005 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B20000000000000000000006 /* IosUnreadWidgetTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IosUnreadWidgetTests.swift; sourceTree = "<group>"; };
 		B20000000000000000000007 /* MeronWidgets.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = MeronWidgets.appex; sourceTree = BUILT_PRODUCTS_DIR; };
-		B20000000000000000000008 /* Widget Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		B20000000000000000000008 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -100,7 +132,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		B20000000000000000000020 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		B20000000000000000000020 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -108,8 +146,8 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000031 /* Meron */,
-				B20000000000000000000014,
-				B20000000000000000000015,
+				B20000000000000000000014 /* WidgetShared */,
+				B20000000000000000000015 /* MeronWidgets */,
 				A10000000000000000000033 /* MeronTests */,
 				A10000000000000000000032 /* Products */,
 				44684984D13B3D27A9CE1F39 /* Version.xcconfig */,
@@ -120,7 +158,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000011 /* Meron.swift */,
-				B20000000000000000000002,
+				B20000000000000000000002 /* IosUnreadWidgets.swift */,
 				A1000000000000000000011C /* IosComposeHost.swift */,
 				A1000000000000000000011A /* LocalizedCatalog.swift */,
 				A10000000000000000000014 /* RustCoreBridge.swift */,
@@ -142,7 +180,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000010 /* Meron.app */,
-				B20000000000000000000007,
+				B20000000000000000000007 /* MeronWidgets.appex */,
 				A10000000000000000000019 /* MeronTests.xctest */,
 			);
 			name = Products;
@@ -152,7 +190,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000018 /* RustCoreBridgeContractTests.swift */,
-				B20000000000000000000006,
+				B20000000000000000000006 /* IosUnreadWidgetTests.swift */,
 				A1000000000000000000001B /* IosNotificationContractTests.swift */,
 				A1000000000000000000001C /* OAuthCallbackContractTests.swift */,
 				A1000000000000000000001D /* IosBackgroundRefreshContractTests.swift */,
@@ -161,8 +199,25 @@
 			path = MeronTests;
 			sourceTree = "<group>";
 		};
-		B20000000000000000000014 = {isa = PBXGroup; children = (B20000000000000000000001, ); path = WidgetShared; sourceTree = "<group>"; };
-		B20000000000000000000015 = {isa = PBXGroup; children = (B20000000000000000000008, B20000000000000000000003, B20000000000000000000004, B20000000000000000000005, ); path = MeronWidgets; sourceTree = "<group>"; };
+		B20000000000000000000014 /* WidgetShared */ = {
+			isa = PBXGroup;
+			children = (
+				B20000000000000000000001 /* UnreadWidgetSnapshot.swift */,
+			);
+			path = WidgetShared;
+			sourceTree = "<group>";
+		};
+		B20000000000000000000015 /* MeronWidgets */ = {
+			isa = PBXGroup;
+			children = (
+				B20000000000000000000008 /* Localizable.xcstrings */,
+				B20000000000000000000003 /* MeronWidgets.swift */,
+				B20000000000000000000004 /* MeronWidgets.entitlements */,
+				B20000000000000000000005 /* Info.plist */,
+			);
+			path = MeronWidgets;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -175,12 +230,12 @@
 				A10000000000000000000050 /* Sources */,
 				A10000000000000000000020 /* Frameworks */,
 				A10000000000000000000116 /* Resources */,
-				B20000000000000000000021,
+				B20000000000000000000021 /* Embed App Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
-				B20000000000000000000029,
+				B20000000000000000000029 /* PBXTargetDependency */,
 			);
 			name = Meron;
 			productName = Meron;
@@ -204,7 +259,24 @@
 			productReference = A10000000000000000000019 /* MeronTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
-		B20000000000000000000028 /* MeronWidgets */ = {isa = PBXNativeTarget; buildConfigurationList = B20000000000000000000032; buildPhases = (B2000000000000000000001E, B20000000000000000000020, B2000000000000000000001F, ); buildRules = (); dependencies = (B2000000000000000000003D, ); name = MeronWidgets; productName = MeronWidgets; productReference = B20000000000000000000007; productType = "com.apple.product-type.app-extension"; };
+		B20000000000000000000028 /* MeronWidgets */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B20000000000000000000032 /* Build configuration list for PBXNativeTarget "MeronWidgets" */;
+			buildPhases = (
+				B2000000000000000000001E /* Sources */,
+				B20000000000000000000020 /* Frameworks */,
+				B2000000000000000000001F /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B2000000000000000000003D /* PBXTargetDependency */,
+			);
+			name = MeronWidgets;
+			productName = MeronWidgets;
+			productReference = B20000000000000000000007 /* MeronWidgets.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -255,8 +327,8 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-                B2000000000000000000003C,
-				B20000000000000000000028,
+				B2000000000000000000003C /* MeronLocalization */,
+				B20000000000000000000028 /* MeronWidgets */,
 				A10000000000000000000040 /* Meron */,
 				A10000000000000000000042 /* MeronTests */,
 			);
@@ -274,7 +346,14 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		B2000000000000000000001F = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (B20000000000000000000011, ); runOnlyForDeploymentPostprocessing = 0; };
+		B2000000000000000000001F /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B20000000000000000000011 /* Localizable.xcstrings in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
@@ -336,7 +415,7 @@
 			);
 			outputPaths = (
 				"$(SRCROOT)/Meron/Localizable.xcstrings",
-                "$(SRCROOT)/MeronWidgets/Localizable.xcstrings",
+				"$(SRCROOT)/MeronWidgets/Localizable.xcstrings",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
@@ -350,8 +429,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000001 /* Meron.swift in Sources */,
-				B2000000000000000000000B,
-				B2000000000000000000000C,
+				B2000000000000000000000B /* UnreadWidgetSnapshot.swift in Sources */,
+				B2000000000000000000000C /* IosUnreadWidgets.swift in Sources */,
 				A1000000000000000000011B /* IosComposeHost.swift in Sources */,
 				A10000000000000000000119 /* LocalizedCatalog.swift in Sources */,
 				A10000000000000000000003 /* RustCoreBridge.swift in Sources */,
@@ -367,7 +446,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A10000000000000000000006 /* RustCoreBridgeContractTests.swift in Sources */,
-				B2000000000000000000000F,
+				B2000000000000000000000F /* IosUnreadWidgetTests.swift in Sources */,
 				A10000000000000000000008 /* IosNotificationContractTests.swift in Sources */,
 				A10000000000000000000009 /* OAuthCallbackContractTests.swift in Sources */,
 				A1000000000000000000000A /* IosBackgroundRefreshContractTests.swift in Sources */,
@@ -375,7 +454,15 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		B2000000000000000000001E = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B2000000000000000000000D, B2000000000000000000000E, ); runOnlyForDeploymentPostprocessing = 0; };
+		B2000000000000000000001E /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B2000000000000000000000D /* UnreadWidgetSnapshot.swift in Sources */,
+				B2000000000000000000000E /* MeronWidgets.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
@@ -384,8 +471,16 @@
 			target = A10000000000000000000040 /* Meron */;
 			targetProxy = A10000000000000000000090 /* PBXContainerItemProxy */;
 		};
-		B20000000000000000000029 = {isa = PBXTargetDependency; target = B20000000000000000000028; targetProxy = B2000000000000000000002A; };
-        B2000000000000000000003D = {isa = PBXTargetDependency; target = B2000000000000000000003C; targetProxy = B2000000000000000000003E; };
+		B20000000000000000000029 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B20000000000000000000028 /* MeronWidgets */;
+			targetProxy = B2000000000000000000002A /* PBXContainerItemProxy */;
+		};
+		B2000000000000000000003D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = B2000000000000000000003C /* MeronLocalization */;
+			targetProxy = B2000000000000000000003E /* PBXContainerItemProxy */;
+		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
@@ -663,38 +758,66 @@
 			};
 			name = Release;
 		};
-		B20000000000000000000033 /* Debug */ = {isa = XCBuildConfiguration; baseConfigurationReference = 44684984D13B3D27A9CE1F39; buildSettings = {
-        APPLICATION_EXTENSION_API_ONLY = YES;
-        CODE_SIGN_ENTITLEMENTS = MeronWidgets/MeronWidgets.entitlements;
-        CODE_SIGN_STYLE = Automatic;
-        DEVELOPMENT_TEAM = NXW8RMPV8L;
-        GENERATE_INFOPLIST_FILE = YES;
-        INFOPLIST_FILE = MeronWidgets/Info.plist;
-        IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-        LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", );
-        PRODUCT_BUNDLE_IDENTIFIER = jp.nonbili.meron.widgets;
-        PRODUCT_NAME = "$(TARGET_NAME)";
-        SKIP_INSTALL = YES;
-        SWIFT_VERSION = 5.0;
-        TARGETED_DEVICE_FAMILY = "1,2";
-    }; name = Debug; };
-		B20000000000000000000034 /* Release */ = {isa = XCBuildConfiguration; baseConfigurationReference = 44684984D13B3D27A9CE1F39; buildSettings = {
-        APPLICATION_EXTENSION_API_ONLY = YES;
-        CODE_SIGN_ENTITLEMENTS = MeronWidgets/MeronWidgets.entitlements;
-        CODE_SIGN_STYLE = Automatic;
-        DEVELOPMENT_TEAM = NXW8RMPV8L;
-        GENERATE_INFOPLIST_FILE = YES;
-        INFOPLIST_FILE = MeronWidgets/Info.plist;
-        IPHONEOS_DEPLOYMENT_TARGET = 17.0;
-        LD_RUNPATH_SEARCH_PATHS = ("$(inherited)", "@executable_path/Frameworks", "@executable_path/../../Frameworks", );
-        PRODUCT_BUNDLE_IDENTIFIER = jp.nonbili.meron.widgets;
-        PRODUCT_NAME = "$(TARGET_NAME)";
-        SKIP_INSTALL = YES;
-        SWIFT_VERSION = 5.0;
-        TARGETED_DEVICE_FAMILY = "1,2";
-    }; name = Release; };
-        B20000000000000000000041 = {isa = XCBuildConfiguration; buildSettings = {}; name = Debug; };
-        B20000000000000000000042 = {isa = XCBuildConfiguration; buildSettings = {}; name = Release; };
+		B20000000000000000000033 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 44684984D13B3D27A9CE1F39 /* Version.xcconfig */;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = MeronWidgets/MeronWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = NXW8RMPV8L;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MeronWidgets/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = jp.nonbili.meron.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		B20000000000000000000034 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = 44684984D13B3D27A9CE1F39 /* Version.xcconfig */;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = MeronWidgets/MeronWidgets.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = NXW8RMPV8L;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = MeronWidgets/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = jp.nonbili.meron.widgets;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		B20000000000000000000041 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+			};
+			name = Debug;
+		};
+		B20000000000000000000042 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -725,8 +848,24 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
-		B20000000000000000000032 = {isa = XCConfigurationList; buildConfigurations = (B20000000000000000000033, B20000000000000000000034, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
-        B20000000000000000000040 = {isa = XCConfigurationList; buildConfigurations = (B20000000000000000000041, B20000000000000000000042, ); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+		B20000000000000000000032 /* Build configuration list for PBXNativeTarget "MeronWidgets" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B20000000000000000000033 /* Debug */,
+				B20000000000000000000034 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		B20000000000000000000040 /* Build configuration list for PBXAggregateTarget "MeronLocalization" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B20000000000000000000041 /* Debug */,
+				B20000000000000000000042 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
 /* End XCConfigurationList section */
 	};
 	rootObject = A10000000000000000000041 /* Project object */;

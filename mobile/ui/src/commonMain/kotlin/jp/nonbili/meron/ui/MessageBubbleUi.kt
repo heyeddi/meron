@@ -215,7 +215,9 @@ internal fun MessageBubble(
         }
     val themedBubbleColor = if (outgoing) chat.bubbleOut else chat.bubbleIn
     val textColor = if (outgoing) chat.bubbleOutText else chat.bubbleInText
-    val bodyMaxHeight = 360.dp
+    // Capped, a long body scrolls inside its bubble; uncapped (the full
+    // messages setting), it grows to fit and only the conversation scrolls.
+    val bodyMaxHeight = if (LocalChatFullMessages.current) Dp.Unspecified else 360.dp
     val htmlBody = usesHtmlBody(message, preferHtml, searchQuery)
     // The web view paints the mail on white, so a tinted light bubble (Material
     // You) would frame it as a square white box inside a rounded card. Let the
@@ -741,10 +743,10 @@ internal fun ColumnScope.MessageBodyContent(
             }
         }
         if (bodyMaxHeight == Dp.Unspecified) {
-            // Uncapped (the traditional layout): the message is as tall as it
-            // needs to be and the conversation list scrolls it. A nested
-            // scroller here would be measured with an infinite height by the
-            // lazy list and throw.
+            // Uncapped (the traditional layout, or full chat messages): the
+            // message is as tall as it needs to be and the conversation list
+            // scrolls it. A nested scroller here would be measured with an
+            // infinite height by the lazy list and throw.
             Box(Modifier.padding(horizontal = chromeInset)) { bodyText() }
         } else {
             val bodyScrollState = rememberScrollState()

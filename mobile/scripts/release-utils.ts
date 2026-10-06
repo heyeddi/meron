@@ -91,6 +91,27 @@ export const copyFile = async (source: string, destination: string) => {
   await Bun.write(destination, Bun.file(source))
 }
 
+// App Review rejects "What's New" text that names another platform (guideline
+// 2.3.10), and the changelogs are shared with stores where those lines belong.
+// "Windows" only capitalised, so a line about the app's windows is kept.
+const otherPlatforms = /\b(android|google play|f-droid|linux|flatpak|appimage|snap packages?)\b/i
+const namesOtherPlatform = (line: string) => otherPlatforms.test(line) || /\bWindows\b/.test(line)
+
+// Writes the changelog at `source` to `destination` for an Apple store, without
+// the lines about other platforms.
+export const writeAppleReleaseNotes = async (source: string, destination: string) => {
+  const lines = (await Bun.file(source).text()).split('\n')
+  const kept = lines.filter((line) => !namesOtherPlatform(line))
+  for (const line of lines.filter(namesOtherPlatform)) {
+    console.log(`Dropping from release notes: ${line}`)
+  }
+  if (kept.every((line) => line.trim() === '')) {
+    fail(`No release notes left for Apple in ${source}`)
+  }
+  await Bun.$`mkdir -p ${dirname(destination)}`
+  await Bun.write(destination, kept.join('\n'))
+}
+
 export const fail = (message: string): never => {
   console.error(`Error: ${message}`)
   process.exit(1)

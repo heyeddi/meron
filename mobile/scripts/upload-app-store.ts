@@ -4,7 +4,6 @@ import { resolve } from 'node:path'
 import {
   changelogSource,
   commandExists,
-  copyFile,
   ensureFile,
   envFlag,
   fail,
@@ -12,6 +11,7 @@ import {
   packageInfo,
   requireEnv,
   run,
+  writeAppleReleaseNotes,
 } from './release-utils'
 
 const [ipaArg] = Bun.argv.slice(2)
@@ -45,7 +45,7 @@ if (!(await commandExists('bundle'))) {
 // Derive the iOS release notes from the shared source changelog (keyed by versionCode).
 const source = changelogSource(pkg.versionCode)
 await ensureFile(source, `Changelog not found: ${source}`)
-await copyFile(source, releaseNotesPath)
+await writeAppleReleaseNotes(source, releaseNotesPath)
 console.log(`Using release notes from ${source}`)
 
 if (!skipBinaryUpload && skipBuild) {

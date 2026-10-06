@@ -334,6 +334,7 @@ internal class MeronMobileState(
     var showSenderImages by mutableStateOf(loadAppBoolean(prefs, SHOW_SENDER_IMAGES_PREF, false))
     var darkMailBodies by mutableStateOf(loadAppBoolean(prefs, DARK_MAIL_BODIES_PREF, false))
     var autoFitMessages by mutableStateOf(loadAppBoolean(prefs, AUTO_FIT_MESSAGES_PREF, false))
+    var chatFullMessages by mutableStateOf(loadAppBoolean(prefs, CHAT_FULL_MESSAGES_PREF, false))
     var readerBottomActions by mutableStateOf(loadAppBoolean(prefs, READER_BOTTOM_ACTIONS_PREF, false))
     var liveMailPushEnabled by mutableStateOf(loadAppBoolean(prefs, LIVE_MAIL_PUSH_PREF, false))
     var backgroundSyncEnabled by mutableStateOf(loadAppBoolean(prefs, BACKGROUND_SYNC_ENABLED_PREF, true))

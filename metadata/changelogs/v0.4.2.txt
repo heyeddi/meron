@@ -1,0 +1,7 @@
+- Export threads, selections and folders as .eml
+- Option to show full message content in chat
+- Scale composer text with message text size
+- Slide tasks and details panels open and closed
+- Simplify task dragging and inline editing
+- Conceal startup window until the UI is rendered
+- Fold Outlook quotes
