@@ -213,7 +213,8 @@ pub fn thread_gap_search_folders_dedup_case_insensitively() {
 
 #[test]
 pub fn prefetch_blames_a_message_only_for_failures_of_its_own() {
-    // Too slow for its budget, or refused by the server: the message's.
+    // Went silent or outlasted its allowance, or refused by the server:
+    // potentially the message's.
     assert!(prefetch_failure_is_the_messages(
         &TransferTimedOut(Duration::from_secs(120)).into()
     ));

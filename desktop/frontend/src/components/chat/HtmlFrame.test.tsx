@@ -164,3 +164,45 @@ it('does not poll when the current srcdoc was already parsed before setup', () =
     window.cancelAnimationFrame = cancel
   }
 })
+
+it('rewires a reader at load after an earlier interactive ready callback', () => {
+  const readied: DocumentReadyState[] = []
+  const disposed: DocumentReadyState[] = []
+  const { container, rerender } = render(
+    <HtmlFrame
+      html="<p>Message</p>"
+      title="Message"
+      onReady={(doc) => {
+        readied.push(doc.readyState)
+        return () => {
+          disposed.push(doc.readyState)
+        }
+      }}
+    />,
+  )
+  const frame = container.querySelector('iframe')!
+  const doc = new DOMParser().parseFromString('<p>Message</p><img src="pending.png">', 'text/html')
+  let state: DocumentReadyState = 'interactive'
+  Object.defineProperty(doc, 'readyState', { get: () => state })
+  Object.defineProperty(frame, 'contentDocument', { get: () => doc })
+  readied.length = 0
+  disposed.length = 0
+  rerender(
+    <HtmlFrame
+      html="<p>Message with image</p>"
+      title="Message"
+      onReady={(doc) => {
+        readied.push(doc.readyState)
+        return () => {
+          disposed.push(doc.readyState)
+        }
+      }}
+    />,
+  )
+  expect(readied).toEqual(['interactive'])
+  disposed.length = 0
+  state = 'complete'
+  fireEvent.load(frame)
+  expect(readied).toEqual(['interactive', 'complete'])
+  expect(disposed).toEqual(['complete'])
+})

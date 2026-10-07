@@ -111,7 +111,7 @@ pub(crate) async fn starttls_socket(tcp: tokio::net::TcpStream) -> Result<tokio:
         "smtp greeting",
         SmtpTransport::new(
             SmtpClient::new(),
-            BufReader::new(crate::imap::Stream::Plain(tcp)),
+            BufReader::new(crate::imap::Stream::plain(tcp)),
         ),
     )
     .await?
@@ -120,8 +120,8 @@ pub(crate) async fn starttls_socket(tcp: tokio::net::TcpStream) -> Result<tokio:
         .await?
         .context("SMTP STARTTLS")?;
     match inner.into_inner() {
-        crate::imap::Stream::Plain(tcp) => Ok(tcp),
-        crate::imap::Stream::Tls(_) => Err(anyhow::anyhow!(
+        crate::imap::Stream::Plain(tcp, _) => Ok(tcp),
+        crate::imap::Stream::Tls(_, _) => Err(anyhow::anyhow!(
             "STARTTLS requested on an already-TLS stream"
         )),
     }
@@ -401,8 +401,8 @@ pub async fn send(
             .await?
             .context("SMTP STARTTLS")?;
         let tcp = match inner.into_inner() {
-            crate::imap::Stream::Plain(tcp) => tcp,
-            crate::imap::Stream::Tls(_) => {
+            crate::imap::Stream::Plain(tcp, _) => tcp,
+            crate::imap::Stream::Tls(_, _) => {
                 return Err(anyhow::anyhow!(
                     "STARTTLS requested on an already-TLS stream"
                 ));
@@ -411,7 +411,7 @@ pub async fn send(
         let tls = crate::imap::upgrade_to_tls(host, tcp, creds.smtp_cert_pin.as_deref())
             .await
             .map_err(as_smtp_cert_error)?;
-        let upgraded = crate::imap::Stream::Tls(Box::new(tls));
+        let upgraded = crate::imap::Stream::tls(Box::new(tls));
         transport = with_timeout(
             SMTP_COMMAND_TIMEOUT,
             "smtp ehlo",

@@ -24,8 +24,26 @@ use crate::parse;
 /// STARTTLS upgrade is not yet supported.
 #[derive(Debug)]
 pub enum Stream {
-    Plain(TcpStream),
-    Tls(Box<TlsStream<TcpStream>>),
+    Plain(TcpStream, ReadProgress),
+    Tls(Box<TlsStream<TcpStream>>, ReadProgress),
+}
+
+pub(crate) type ReadProgress = std::sync::Arc<std::sync::Mutex<Option<tokio::time::Instant>>>;
+
+impl Stream {
+    pub fn plain(socket: TcpStream) -> Self {
+        Self::Plain(socket, Default::default())
+    }
+
+    pub fn tls(socket: Box<TlsStream<TcpStream>>) -> Self {
+        Self::Tls(socket, Default::default())
+    }
+
+    pub(crate) fn observe_reads(&mut self, progress: ReadProgress) {
+        match self {
+            Self::Plain(_, clock) | Self::Tls(_, clock) => *clock = progress,
+        }
+    }
 }
 
 impl AsyncRead for Stream {
@@ -34,10 +52,18 @@ impl AsyncRead for Stream {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_read(cx, buf),
+        let before = buf.filled().len();
+        let (result, progress) = match self.get_mut() {
+            Stream::Plain(s, progress) => (Pin::new(s).poll_read(cx, buf), progress),
+            Stream::Tls(s, progress) => (Pin::new(s.as_mut()).poll_read(cx, buf), progress),
+        };
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            let mut clock = progress.lock().unwrap();
+            if clock.is_some() {
+                *clock = Some(tokio::time::Instant::now());
+            }
         }
+        result
     }
 }
 
@@ -48,20 +74,20 @@ impl AsyncWrite for Stream {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_write(cx, buf),
+            Stream::Plain(s, _) => Pin::new(s).poll_write(cx, buf),
+            Stream::Tls(s, _) => Pin::new(s.as_mut()).poll_write(cx, buf),
         }
     }
     fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_flush(cx),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_flush(cx),
+            Stream::Plain(s, _) => Pin::new(s).poll_flush(cx),
+            Stream::Tls(s, _) => Pin::new(s.as_mut()).poll_flush(cx),
         }
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
         match self.get_mut() {
-            Stream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            Stream::Tls(s) => Pin::new(s.as_mut()).poll_shutdown(cx),
+            Stream::Plain(s, _) => Pin::new(s).poll_shutdown(cx),
+            Stream::Tls(s, _) => Pin::new(s.as_mut()).poll_shutdown(cx),
         }
     }
 }
@@ -76,8 +102,8 @@ pub type Session = async_imap::Session<Stream>;
 /// handle a command failing on a dropped connection.
 pub fn session_looks_open(session: &Session) -> bool {
     match session.get_ref() {
-        Stream::Plain(stream) => tcp_looks_open(stream),
-        Stream::Tls(stream) => tcp_looks_open(stream.get_ref().0),
+        Stream::Plain(stream, _) => tcp_looks_open(stream),
+        Stream::Tls(stream, _) => tcp_looks_open(stream.get_ref().0),
     }
 }
 
@@ -459,11 +485,11 @@ pub async fn connect_stream(
 ) -> Result<Stream> {
     let tcp = open_socket(host, port, proxy).await?;
     if tls {
-        Ok(Stream::Tls(Box::new(
+        Ok(Stream::tls(Box::new(
             upgrade_to_tls(host, tcp, cert_pin).await?,
         )))
     } else {
-        Ok(Stream::Plain(tcp))
+        Ok(Stream::plain(tcp))
     }
 }
 
@@ -548,7 +574,7 @@ impl async_imap::Authenticator for XOAuth2Simple {
 /// handshake, and hand back the raw socket. Used only by the certificate probe
 /// (see [`crate::tls::probe`]); no credentials are ever sent over it.
 pub(crate) async fn starttls_socket(tcp: TcpStream) -> Result<TcpStream> {
-    let mut client = async_imap::Client::new(Stream::Plain(tcp));
+    let mut client = async_imap::Client::new(Stream::plain(tcp));
     tokio::time::timeout(imap_protocol_timeout(), client.read_response())
         .await
         .map_err(|_| anyhow!("timed out"))
@@ -560,8 +586,8 @@ pub(crate) async fn starttls_socket(tcp: TcpStream) -> Result<TcpStream> {
         .await
         .context("STARTTLS")?;
     match client.into_inner() {
-        Stream::Plain(tcp) => Ok(tcp),
-        Stream::Tls(_) => Err(anyhow!("STARTTLS requested on an already-TLS stream")),
+        Stream::Plain(tcp, _) => Ok(tcp),
+        Stream::Tls(_, _) => Err(anyhow!("STARTTLS requested on an already-TLS stream")),
     }
 }
 
@@ -617,11 +643,13 @@ async fn connect_inner(creds: &Creds) -> Result<Session> {
             .await
             .context("STARTTLS")?;
         let tcp = match client.into_inner() {
-            Stream::Plain(tcp) => tcp,
-            Stream::Tls(_) => return Err(anyhow!("STARTTLS requested on an already-TLS stream")),
+            Stream::Plain(tcp, _) => tcp,
+            Stream::Tls(_, _) => {
+                return Err(anyhow!("STARTTLS requested on an already-TLS stream"));
+            }
         };
         let tls = upgrade_to_tls(&creds.host, tcp, creds.cert_pin.as_deref()).await?;
-        client = async_imap::Client::new(Stream::Tls(Box::new(tls)));
+        client = async_imap::Client::new(Stream::tls(Box::new(tls)));
     }
 
     let auth_started = std::time::Instant::now();
@@ -1344,20 +1372,6 @@ pub async fn sync_flags(
     })
 }
 
-pub async fn read_message(
-    session: &mut Session,
-    folder: &str,
-    uid: u32,
-    media: &parse::MediaCtx,
-) -> Result<parse::Message> {
-    session.select(folder).await.context("SELECT")?;
-    // Opening a thread should not mark it read until the reader reaches the
-    // bottom. Use PEEK here and let the explicit mark-read path set \Seen.
-    fetch_full_message(session, uid, media, true)
-        .await?
-        .ok_or_else(|| anyhow!("message uid {uid} not found in {folder}"))
-}
-
 /// SELECT `folder` as the preflight of a flag update. Pooled sessions die
 /// silently, and the SELECT is the first command that notices, so running it
 /// as a separate phase lets a stale connection be replaced before any STORE
@@ -1961,6 +1975,44 @@ pub async fn fetch_bodies(
     account: &str,
     on_message: &mut (dyn FnMut(u32, parse::Message) + Send),
 ) -> Result<()> {
+    // One recursive walk per batch, including one cut short by an error, a
+    // deadline or cancellation: what arrived before that is already on disk.
+    let mut prune = PruneMediaOnDrop(Some(media_root.clone()));
+    let result =
+        fetch_bodies_unpruned(session, folder, uids, media_root, account, on_message).await;
+    // A fetch that ran to its end waits for the prune, so a caller counting
+    // attachment files afterwards sees the ones that are going to stay.
+    if let Some(root) = prune.0.take() {
+        let _ = tokio::task::spawn_blocking(move || parse::prune_media_cache(&root)).await;
+    }
+    result
+}
+
+/// Prunes the media cache when a body fetch is dropped where it stands, by a
+/// caller's timeout or cancellation, and so never reaches its own prune.
+struct PruneMediaOnDrop(Option<std::path::PathBuf>);
+
+impl Drop for PruneMediaOnDrop {
+    fn drop(&mut self) {
+        let Some(root) = self.0.take() else {
+            return;
+        };
+        // On a blocking worker when there is a runtime to lend one.
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(move || parse::prune_media_cache(&root))),
+            Err(_) => parse::prune_media_cache(&root),
+        }
+    }
+}
+
+async fn fetch_bodies_unpruned(
+    session: &mut Session,
+    folder: &str,
+    uids: &[u32],
+    media_root: std::path::PathBuf,
+    account: &str,
+    on_message: &mut (dyn FnMut(u32, parse::Message) + Send),
+) -> Result<()> {
     session.select(folder).await.context("SELECT")?;
     for chunk in uids.chunks(BODY_FETCH_BATCH) {
         if chunk.is_empty() {
@@ -1985,7 +2037,7 @@ pub async fn fetch_bodies(
                 folder: folder.to_string(),
                 uid,
             };
-            let mut parsed = parse::parse_message(body, Some(&media));
+            let mut parsed = parse::parse_message_unpruned(body, Some(&media));
             parsed.date = message_date(parsed.date, &fetch);
             on_message(uid, parsed);
         }
@@ -2708,7 +2760,7 @@ mod tests {
         tokio::spawn(serve_canned(listener, fetch_reply));
 
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut client = async_imap::Client::new(super::Stream::Plain(tcp));
+        let mut client = async_imap::Client::new(super::Stream::plain(tcp));
         client.read_response().await.unwrap().unwrap();
         let mut session = client.login("u", "p").await.map_err(|(e, _)| e).unwrap();
         match super::fetch_recent(&mut session, "INBOX", 50).await {
@@ -3032,7 +3084,7 @@ mod append_tests {
             literal
         });
         let tcp = TcpStream::connect(addr).await.unwrap();
-        let mut client = async_imap::Client::new(Stream::Plain(tcp));
+        let mut client = async_imap::Client::new(Stream::plain(tcp));
         client.read_response().await.unwrap().unwrap();
         let session = client
             .login("u", "p")
@@ -3138,7 +3190,7 @@ mod mcp_mutation_tests {
             }
         });
         let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let mut client = async_imap::Client::new(Stream::Plain(tcp));
+        let mut client = async_imap::Client::new(Stream::plain(tcp));
         client.read_response().await.unwrap().unwrap();
         let session = client
             .login("test", "test")

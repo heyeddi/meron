@@ -335,6 +335,26 @@ describe('prepareBubbleHtml', () => {
       }
     })
 
+    it('disowns sender style tags however they are written, without changing message text', () => {
+      const claims = [
+        `<style/data-meron-frame-style="x">p { color: red; }</style>`,
+        `<style DATA-MERON-FRAME-STYLE="x">p { color: red; }</style>`,
+        // An empty comment, then a real style tag.
+        `<!--><style data-meron-frame-style="x">p { color: red; }</style>`,
+        // A stray `<` and a quote ahead of the tag.
+        `a < "b" <style data-meron-frame-style="x">p { color: red; }</style>`,
+      ]
+      for (const claim of claims) {
+        const out = prepareBubbleHtml(coreDocument(`<p>data-meron-frame-style="x"</p>${claim}`))
+        const doc = new DOMParser().parseFromString(out, 'text/html')
+        // Only the frame's own stylesheet carries the marker.
+        const marked = [...doc.querySelectorAll('[data-meron-frame-style]')]
+        expect(marked).toHaveLength(1)
+        expect(marked[0].getAttribute('data-meron-frame-style')).not.toBe('x')
+        expect(doc.querySelector('p')?.textContent).toBe('data-meron-frame-style="x"')
+      }
+    })
+
     it('stamps the generation the host asked for', () => {
       // The host wires a frame as soon as its srcDoc changes, while the document
       // it replaces is still loaded; this is how it tells them apart.

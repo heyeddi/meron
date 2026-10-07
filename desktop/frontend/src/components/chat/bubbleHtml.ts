@@ -3,6 +3,7 @@ import { QUOTE_FOLDED_CLASS, QUOTE_TOGGLE_CLASS } from './quoteFold'
 import { allowRemoteContent, allowRemoteInCsp, blockRemoteContent, blockRemoteInCsp } from './remoteContentCsp'
 import {
   DARKENED_ATTR,
+  FRAME_STYLE_MARKER,
   DARKENED_CSS,
   DEFAULT_BUBBLE_THEME,
   LIGHT_ON_DARK_TEXT,
@@ -150,8 +151,6 @@ function emptyDocument(): Document {
 const CORE_SHELL_OPEN = '<!doctype html><html><head>'
 const CORE_BODY_OPEN = '</head><body>'
 
-const FRAME_STYLE_ATTR = /\sdata-meron-frame-style(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]*))?/gi
-
 function escapeAttr(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 }
@@ -196,7 +195,9 @@ function rewriteCspMeta(tag: string, rewrite: (csp: string) => string): string {
 }
 
 // The frame's tags spliced into a document from the core, so the iframe's parse
-// is the only one. Null for anything else, which is parsed and rebuilt instead.
+// is the only one. Null for anything else, which is parsed and rebuilt instead:
+// that includes a body that mentions the frame stylesheet marker at all, since
+// only the parser can say whether the mention is an attribute or just text.
 //
 // No doctype is written back: the parsed path serialises the root element
 // alone, and a message must lay out the same whichever path prepared it.
@@ -215,8 +216,8 @@ function assembleCoreDocument(
   // the caller's decision. The frame's CSP goes ahead of it and blocks on its
   // own, so a rewrite that misses can only keep pictures hidden.
   const head = rewriteCspMetas(rest.slice(0, bodyAt), allowRemote ? allowRemoteInCsp : blockRemoteInCsp)
-  // Anything that arrived claiming to be a frame stylesheet isn't one.
-  const body = rest.slice(bodyAt + CORE_BODY_OPEN.length).replace(FRAME_STYLE_ATTR, '')
+  const body = rest.slice(bodyAt + CORE_BODY_OPEN.length)
+  if (body.toLowerCase().includes(FRAME_STYLE_MARKER)) return null
   return (
     `<html ${FRAME_GENERATION_MARKER}="${escapeAttr(generation)}" style="${SIZING_STYLE}">` +
     `<head>${csp}${head}${style}</head><body style="${SIZING_STYLE}">${body}`

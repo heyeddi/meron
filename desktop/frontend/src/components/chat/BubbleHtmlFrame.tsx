@@ -422,14 +422,22 @@ export function BubbleHtmlFrame({
       void fontReady
 
       const initialTheme = bubbleThemeRef.current
+      const remembersHeight = measuredHeights.has(`${documentKey}:${initialTheme.appearance}`)
       const finishTheme = () => {
         if (disposed) return
         themed = true
         appliedThemeRef.current = { doc, theme: initialTheme }
         setFrameDoc(doc)
+        // A remount is already at the height this document measured to: show
+        // it the moment it is themed, and let the measurement that follows
+        // correct the height if the layout has changed since.
+        if (remembersHeight) {
+          heightKeyRef.current = documentKey
+          setMeasured(true)
+        }
         scheduleMeasure()
       }
-      void applyBubbleThemeAsync(doc, initialTheme, () => disposed).then(finishTheme, (error) => {
+      const themeFailed = (error: unknown) => {
         // A styling failure must not hide otherwise readable message text.
         if (disposed) return
         console.warn('Could not theme message HTML', error)
@@ -439,7 +447,10 @@ export function BubbleHtmlFrame({
           console.warn('Could not apply fallback message theme', fallbackError)
         }
         finishTheme()
-      })
+      }
+      // Batched even for a remount: the walk over a large newsletter would
+      // otherwise block scrolling once per frame that comes back into view.
+      void applyBubbleThemeAsync(doc, initialTheme, () => disposed).then(finishTheme, themeFailed)
       cleanupFns.push(() => setFrameDoc((current) => (current === doc ? null : current)))
 
       return () => {

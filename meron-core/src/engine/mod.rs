@@ -15,6 +15,8 @@ mod append;
 mod background_sync;
 mod folders;
 mod prefetch;
+#[cfg(test)]
+pub(crate) use prefetch::transfer_clock_tests::slow_fetch_engine;
 mod read;
 mod search;
 mod sync;
@@ -79,6 +81,14 @@ pub struct Engine {
     /// [`message_key`], so re-reads cannot duplicate a download while other
     /// pages and new messages in the thread remain independently fetchable.
     pub body_fetches: std::sync::Mutex<HashSet<String>>,
+    /// Uncached-body background failures and when each happened, consumed by
+    /// the next read so its UI can show an error without starting an automatic
+    /// fetch/notification loop. Only answers for [`BODY_FAILURE_TTL`]: an old
+    /// failure says nothing about the connection now.
+    pub body_fetch_failures: std::sync::Mutex<HashMap<String, (String, std::time::Instant)>>,
+    /// Pulsed when a background body fetch ends, so a read waiting on one of
+    /// its messages looks at the cache again.
+    pub body_fetch_done: Notify,
     /// Messages ([`message_key`]) whose attachment files are not to be
     /// fetched again yet. `None`: a download arrived and the files were still
     /// missing, or a successful FETCH omitted the UID (expunged). Another
@@ -232,6 +242,28 @@ pub const POOLED_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// off the download's budget.
 const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a recorded body download failure stands in for a new attempt.
+/// Long enough for the re-read its notification triggers; short enough that
+/// reconnecting or retrying by hand reaches the server again.
+const BODY_FAILURE_TTL: Duration = Duration::from_secs(60);
+
+impl Engine {
+    /// Note that a background fetch could not deliver `key`'s body.
+    pub(crate) fn record_body_failure(&self, key: String, error: String) {
+        let now = std::time::Instant::now();
+        let mut failures = self.body_fetch_failures.lock().unwrap();
+        failures.retain(|_, (_, at)| now.duration_since(*at) < BODY_FAILURE_TTL);
+        failures.insert(key, (error, now));
+    }
+
+    /// The recent failure recorded for `key`, if any. Taking it is what lets
+    /// the read after this one try the server again.
+    pub(crate) fn take_body_failure(&self, key: &str) -> Option<String> {
+        let (error, at) = self.body_fetch_failures.lock().unwrap().remove(key)?;
+        (at.elapsed() < BODY_FAILURE_TTL).then_some(error)
+    }
+}
+
 /// The key the engine's per-message bookkeeping files a message under.
 pub(crate) fn message_key(account: &str, folder: &str, uid: u32) -> String {
     format!("{}{uid}", folder_key_prefix(account, folder))
@@ -310,6 +342,8 @@ impl Engine {
             syncing: std::sync::Mutex::new(HashSet::new()),
             gap_attempts: std::sync::Mutex::new(HashMap::new()),
             body_fetches: std::sync::Mutex::new(HashSet::new()),
+            body_fetch_failures: std::sync::Mutex::new(HashMap::new()),
+            body_fetch_done: Notify::new(),
             media_recovery_hold: std::sync::Mutex::new(HashMap::new()),
             prefetch_skipped: std::sync::Mutex::new(HashSet::new()),
             pause_signal: Notify::new(),

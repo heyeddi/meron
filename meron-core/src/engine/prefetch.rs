@@ -23,8 +23,7 @@ const PREFETCH_BATCH: usize = imap::BODY_FETCH_BATCH;
 /// anything can be downloaded at all.
 const PREFETCH_MAX_FAILURES: usize = 3;
 
-/// How long a prefetch download may go without a message arriving. A stall is
-/// what a dead socket looks like; a large message is given this long to land.
+/// How long a prefetch download may go without receiving bytes.
 const PREFETCH_IDLE: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
@@ -84,15 +83,17 @@ pub async fn prefetch_bodies_with_options(
             Box::pin(async move { imap::search_prefetch_uids(session, &folder, days).await })
         })
         .await?;
-    let pending: Vec<u32> = {
+    let wanted: Vec<u32> = {
         let db = engine.db.lock().unwrap();
-        let wanted: Vec<u32> = uids
-            .into_iter()
+        uids.into_iter()
             .filter(|uid| {
                 store::has_message(&db, account, folder, *uid).unwrap_or(false)
                     && !store::has_cached_body(&db, account, folder, *uid).unwrap_or(false)
             })
-            .collect();
+            .collect()
+    };
+    let pending: Vec<u32> = {
+        let wanted_set: HashSet<u32> = wanted.iter().copied().collect();
         // Only mail that is still waiting stays on the list: not once the
         // on-demand reader cached it, it left the window, or it was deleted.
         let mut skipped = engine.prefetch_skipped.lock().unwrap();
@@ -100,7 +101,7 @@ pub async fn prefetch_bodies_with_options(
         skipped.retain(|key| {
             key.strip_prefix(ours.as_str())
                 .and_then(|uid| uid.parse::<u32>().ok())
-                .is_none_or(|uid| wanted.contains(&uid))
+                .is_none_or(|uid| wanted_set.contains(&uid))
         });
         wanted
             .into_iter()
@@ -205,10 +206,11 @@ struct Blame {
     failed_twice: Vec<u32>,
 }
 
-/// Whether a failed download may be the message's own doing. A connection that
-/// went away is not. An error the server reported, or a download that stalled,
-/// may be — or may be the account or the network, which is why it only makes
-/// the message a suspect (see [`PrefetchRun::recheck`]).
+/// Whether a failed download may be the message's own doing; only asked of a
+/// message downloaded on its own. A connection that went away is not. An
+/// error the server reported, or a download that went silent or outlasted its
+/// allowance, may be — or may be the account or the network, which is why it
+/// only makes the message a suspect (see [`PrefetchRun::after_success`]).
 pub(super) fn prefetch_failure_is_the_messages(err: &anyhow::Error) -> bool {
     err.is::<TransferTimedOut>() || !background_sync::is_transient_sync_error(err)
 }
@@ -276,29 +278,19 @@ async fn prefetch_batch(
         media_root,
         TransferLimits {
             idle: PREFETCH_IDLE,
-            total: PREFETCH_IDLE * uids.len().max(1) as u32,
+            total: Duration::from_secs(600),
         },
     )
     .await;
-    let db = engine.db.lock().unwrap();
-    let saved = fetched
-        .messages
-        .iter()
-        .map(|(_, uid, message)| {
-            let _ = store::save_cached_message(&db, account, folder, *uid, message);
-            *uid
-        })
-        .collect();
+    let saved = fetched.messages.iter().map(|(_, uid, _)| *uid).collect();
     (saved, fetched.result)
 }
 
 /// How long a body download may run.
 #[derive(Clone, Copy)]
 pub(crate) struct TransferLimits {
-    /// The longest the transfer may go without a message arriving, from the
-    /// moment it starts and after each one. This is what ends a download on a
-    /// socket that has gone silent, and it has to be long enough for the
-    /// largest message to land. Connecting is not on this clock.
+    /// The longest the transfer may go without receiving bytes. Connecting
+    /// is not on this clock; a large message can keep making progress.
     pub idle: Duration,
     /// The longest the call may take altogether, connecting included, however
     /// steadily mail arrives.
@@ -328,20 +320,15 @@ pub(crate) struct PartialBodies {
 struct TransferProgress {
     messages: Vec<(String, u32, parse::Message)>,
     attempted: HashSet<String>,
-    /// When the transfer last got somewhere: it started, or a message
-    /// arrived. `None` until a session is in hand, so that connecting — and a
-    /// credential refresh — is not on the idle
-    /// clock.
-    last_progress: Option<tokio::time::Instant>,
 }
 
 // Clear the idle clock whenever an operation ends, including errors and
 // cancellation. Reconnection and credential refresh are not transfer stalls.
-struct ActiveTransfer(Arc<std::sync::Mutex<TransferProgress>>);
+struct ActiveTransfer(imap::ReadProgress);
 
 impl Drop for ActiveTransfer {
     fn drop(&mut self) {
-        self.0.lock().unwrap().last_progress = None;
+        *self.0.lock().unwrap() = None;
     }
 }
 
@@ -357,7 +344,10 @@ pub(crate) async fn fetch_bodies_keeping_partial(
 ) -> PartialBodies {
     // Outside the session future: that is dropped when time runs out.
     let progress: Arc<std::sync::Mutex<TransferProgress>> = Arc::default();
+    let clock: imap::ReadProgress = Arc::default();
     let transfer = engine.with_transfer_session(account, limits.total, |session| {
+        let clock = clock.clone();
+        session.get_mut().observe_reads(clock.clone());
         let progress = progress.clone();
         let account = account.to_string();
         let media_root = media_root.to_path_buf();
@@ -383,8 +373,8 @@ pub(crate) async fn fetch_bodies_keeping_partial(
                 .collect()
         };
         Box::pin(async move {
-            let _active = ActiveTransfer(progress.clone());
-            progress.lock().unwrap().last_progress = Some(tokio::time::Instant::now());
+            let _active = ActiveTransfer(clock.clone());
+            *clock.lock().unwrap() = Some(tokio::time::Instant::now());
             for (folder, uids) in remaining {
                 progress.lock().unwrap().attempted.insert(folder.clone());
                 // peek via fetch_bodies: warming must not flip unread mail to read.
@@ -406,7 +396,6 @@ pub(crate) async fn fetch_bodies_keeping_partial(
                         );
                         let mut progress = progress.lock().unwrap();
                         progress.messages.push((folder.clone(), uid, message));
-                        progress.last_progress = Some(tokio::time::Instant::now());
                     },
                 )
                 .await?;
@@ -416,20 +405,19 @@ pub(crate) async fn fetch_bodies_keeping_partial(
     });
     tokio::pin!(transfer);
     let result = loop {
-        let last_progress = progress.lock().unwrap().last_progress;
+        let last_progress = *clock.lock().unwrap();
         // Not transferring yet: nothing to time, look again shortly.
         let wake = match last_progress {
             Some(at) => at + limits.idle,
-            None => tokio::time::Instant::now() + Duration::from_secs(1),
+            None => tokio::time::Instant::now() + limits.idle.min(Duration::from_secs(1)),
         };
         tokio::select! {
             result = &mut transfer => break result,
-            // A message may have arrived while this slept: look again.
+            // Bytes may have arrived while this slept: look again.
             () = tokio::time::sleep_until(wake) => {
-                let stalled = progress
+                let stalled = clock
                     .lock()
                     .unwrap()
-                    .last_progress
                     .is_some_and(|at| at + limits.idle <= tokio::time::Instant::now());
                 if stalled {
                     break Err(TransferTimedOut(limits.idle).into());
@@ -475,13 +463,12 @@ pub async fn fetch_bodies_for_uids(
         account,
         &wanted,
         &media_root,
-        TransferLimits::within(PREFETCH_IDLE),
+        TransferLimits {
+            idle: PREFETCH_IDLE,
+            total: Duration::from_secs(600),
+        },
     )
     .await;
-    let db = engine.db.lock().unwrap();
-    for (_, uid, message) in &fetched.messages {
-        let _ = store::save_cached_message(&db, account, folder, *uid, message);
-    }
     fetched.result.map(|()| fetched.messages.len())
 }
 
@@ -540,15 +527,157 @@ pub fn spawn_files_backfill(engine: Arc<Engine>) {
 }
 
 #[cfg(test)]
-mod transfer_clock_tests {
+pub(crate) mod transfer_clock_tests {
     use super::*;
+
+    pub(crate) async fn slow_fetch_engine(
+        connections: usize,
+        delay: Duration,
+        fail: bool,
+    ) -> (Arc<Engine>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        struct Host;
+        impl EngineHost for Host {
+            fn open_db(&self) -> anyhow::Result<rusqlite::Connection> {
+                store::open_at(":memory:")
+            }
+            fn apply_secret(&self, _: &rusqlite::Connection, _: &str, _: &mut imap::Creds) {}
+            fn store_secret(
+                &self,
+                _: &rusqlite::Connection,
+                _: &str,
+                _: &crate::secrets::Secrets,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            for _ in 0..connections {
+                let (socket, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = socket.into_split();
+                writer.write_all(b"* OK ready\r\n").await.unwrap();
+                let mut lines = tokio::io::BufReader::new(reader).lines();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let (tag, command) = line.split_once(' ').unwrap();
+                    if command.starts_with("UID FETCH") {
+                        if fail {
+                            tokio::time::sleep(delay).await;
+                            // Close in the middle of a literal so FETCH fails
+                            // before delivering any complete message.
+                            let _ = writer
+                                .write_all(b"* 1 FETCH (UID 1 BODY[] {100}\r\npartial")
+                                .await;
+                            break;
+                        }
+                        let body = "Message-ID: <slow@test>\r\nSubject: Slow\r\n\r\nSlow body";
+                        writer
+                            .write_all(
+                                format!("* 1 FETCH (UID 1 BODY[] {{{}}}\r\n", body.len())
+                                    .as_bytes(),
+                            )
+                            .await
+                            .unwrap();
+                        let mut closed = false;
+                        for chunk in body.as_bytes().chunks(4) {
+                            tokio::time::sleep(delay).await;
+                            if writer.write_all(chunk).await.is_err() {
+                                closed = true;
+                                break;
+                            }
+                        }
+                        if !closed {
+                            let _ = writer
+                                .write_all(format!(")\r\n{tag} OK done\r\n").as_bytes())
+                                .await;
+                        }
+                        break;
+                    }
+                    if command.starts_with("SELECT") {
+                        writer.write_all(b"* 1 EXISTS\r\n").await.unwrap();
+                    }
+                    writer
+                        .write_all(format!("{tag} OK done\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let engine = Arc::new(Engine::new(Box::new(Host)).unwrap());
+        let creds = {
+            let db = engine.db.lock().unwrap();
+            let config = serde_json::json!({"host":"127.0.0.1", "port":port, "tls":false, "user":"u", "proxy":{"mode":"direct"}}).to_string();
+            db.execute(
+                "INSERT INTO accounts(id, config) VALUES('acc', ?1)",
+                [&config],
+            )
+            .unwrap();
+            store::upsert_messages(
+                &db,
+                "acc",
+                "INBOX",
+                &[imap::MessageHeader {
+                    uid: 1,
+                    subject: "Slow".into(),
+                    from_addr: "a@test".into(),
+                    ..Default::default()
+                }],
+            )
+            .unwrap();
+            store::load_account(&db, "acc").unwrap().unwrap()
+        };
+        engine.accounts.lock().await.insert("acc".into(), creds);
+        (engine, server)
+    }
+
+    #[tokio::test]
+    async fn bytes_extend_the_idle_budget_before_a_whole_message_arrives() {
+        let (engine, server) = slow_fetch_engine(1, Duration::from_millis(25), false).await;
+        let wanted = BTreeMap::from([("INBOX".to_string(), vec![1])]);
+        let fetched = fetch_bodies_keeping_partial(
+            &engine,
+            "acc",
+            &wanted,
+            &std::env::temp_dir(),
+            TransferLimits {
+                idle: Duration::from_millis(100),
+                total: Duration::from_secs(3),
+            },
+        )
+        .await;
+        fetched.result.unwrap();
+        assert_eq!(fetched.messages.len(), 1);
+        assert_eq!(fetched.messages[0].2.body.trim(), "Slow body");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_silent_socket_still_expires_before_the_total_budget() {
+        let (engine, server) = slow_fetch_engine(1, Duration::from_millis(300), true).await;
+        let wanted = BTreeMap::from([("INBOX".to_string(), vec![1])]);
+        let fetched = fetch_bodies_keeping_partial(
+            &engine,
+            "acc",
+            &wanted,
+            &std::env::temp_dir(),
+            TransferLimits {
+                idle: Duration::from_millis(50),
+                total: Duration::from_secs(3),
+            },
+        )
+        .await;
+        assert!(fetched.result.unwrap_err().is::<TransferTimedOut>());
+        assert!(fetched.messages.is_empty());
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn ending_an_operation_disarms_the_idle_clock() {
-        let progress: Arc<std::sync::Mutex<TransferProgress>> = Arc::default();
+        let clock: imap::ReadProgress = Arc::default();
         let mut operation = Box::pin(async {
-            let _active = ActiveTransfer(progress.clone());
-            progress.lock().unwrap().last_progress = Some(tokio::time::Instant::now());
+            let _active = ActiveTransfer(clock.clone());
+            *clock.lock().unwrap() = Some(tokio::time::Instant::now());
             std::future::pending::<()>().await;
         });
         assert!(
@@ -558,9 +687,9 @@ mod transfer_clock_tests {
         );
         // The timeout only dropped its reference. Dropping the operation is
         // what disarms the clock before a reconnect starts.
-        assert!(progress.lock().unwrap().last_progress.is_some());
+        assert!(clock.lock().unwrap().is_some());
         drop(operation);
-        assert!(progress.lock().unwrap().last_progress.is_none());
+        assert!(clock.lock().unwrap().is_none());
     }
     #[tokio::test]
     async fn cancelled_prefetch_keeps_messages_received_before_the_batch_finishes() {

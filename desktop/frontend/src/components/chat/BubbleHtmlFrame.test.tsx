@@ -10,7 +10,7 @@ afterEach(() => {
   globalThis.IntersectionObserver = originalObserver
 })
 
-it('hides a fresh iframe when the same bubble comes back into overscan', async () => {
+it('shows a cached remount as soon as its document is themed', async () => {
   let visibility: (near: boolean) => void = () => {}
   globalThis.IntersectionObserver = class {
     constructor(callback: IntersectionObserverCallback) {

@@ -129,6 +129,8 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
   const cleanupReadyRef = useRef<(() => void) | undefined>(undefined)
   // The parsed document `onReady` last ran for.
   const readyDocRef = useRef<Document | null>(null)
+  // Whether that run already saw the document with its pictures loaded.
+  const readyLoadedRef = useRef(false)
   const readyWhenParsedRef = useRef(readyWhenParsed)
   readyWhenParsedRef.current = readyWhenParsed
   const activeScrollListenerRef = useRef<{ win: Window; listener: () => void } | null>(null)
@@ -149,16 +151,21 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
     forwardContextMenuRef.current = forwardContextMenu
   }, [onFrameClick, onReady, onLinkHover, onScroll, onUserScrollIntent, forwardContextMenu])
 
-  const wire = useCallback(() => {
+  const wire = useCallback((atLoad = false) => {
     const iframe = iframeRef.current
     if (!iframe) return
 
     const doc = iframe.contentDocument
     const win = iframe.contentWindow
     if (!doc || !win) return
-    // A body can exist while srcdoc is still parsing. Ready exactly once,
-    // after parsing, without waiting for images or other subresources.
-    if (doc.readyState === 'loading' || readyDocRef.current === doc) return
+    // A body can exist while srcdoc is still parsing: ready only after that.
+    if (doc.readyState === 'loading') return
+    // Ready once per document, so neither a repeated setup nor a new srcDoc
+    // whose document has not replaced this one yet runs the hook again. The
+    // exception is `load` for a reader that did not ask for parsed readiness
+    // and was readied before its pictures were in: scroll restoration needs
+    // the final layout.
+    if (readyDocRef.current === doc && (!atLoad || readyWhenParsedRef.current || readyLoadedRef.current)) return
 
     docRef.current = doc
     winRef.current = win
@@ -305,6 +312,7 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
 
     cleanupReadyRef.current = onReadyRef.current?.(doc, iframe) ?? undefined
     readyDocRef.current = doc
+    readyLoadedRef.current = atLoad || doc.readyState === 'complete'
   }, [])
 
   // Listen to native load events which are guaranteed to fire when srcDoc loads
@@ -315,11 +323,7 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
     // Wire immediately on mount (in case it already loaded)
     wire()
 
-    const onLoad = () => {
-      // Already wired when it was parsed; `load` has nothing to add.
-      if (readyWhenParsedRef.current && readyDocRef.current === iframe.contentDocument) return
-      wire()
-    }
+    const onLoad = () => wire(true)
     iframe.addEventListener('load', onLoad)
 
     return () => {
@@ -376,8 +380,8 @@ export const HtmlFrame = forwardRef(function HtmlFrame(
       cleanupReadyRef.current?.()
       cleanupReadyRef.current = undefined
       // StrictMode replays setup on this same document after disposing its
-      // installed hook. Let setup reinstall it; duplicate load events still
-      // see an active readyDocRef and remain ignored.
+      // installed hook. Let setup reinstall it; a `load` with nothing to add
+      // still sees an active readyDocRef and is ignored.
       readyDocRef.current = null
 
       if (activeScrollListenerRef.current) {

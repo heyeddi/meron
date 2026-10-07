@@ -4384,6 +4384,7 @@ fn save_body_with_attachments(conn: &Connection, uid: u32, keys: &[&str], html: 
                 mime: "application/octet-stream".into(),
                 size: 1,
                 key: Some(key.to_string()),
+                oversized: false,
             })
             .collect(),
         ..Default::default()
@@ -4796,6 +4797,7 @@ fn folded_attachment_metadata_prefers_cached_bodies_including_empty_lists() {
                         mime: "application/pdf".into(),
                         size: 1,
                         key: None,
+                        oversized: false,
                     })
                     .collect(),
                 ..Default::default()

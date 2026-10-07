@@ -165,6 +165,16 @@ pub async fn read_cached_or_fetch(
     folder: &str,
     uid: u32,
 ) -> anyhow::Result<parse::Message> {
+    read_cached_or_fetch_with_budget(engine, account, folder, uid, INLINE_BODY_BUDGET).await
+}
+
+async fn read_cached_or_fetch_with_budget(
+    engine: &Arc<Engine>,
+    account: &str,
+    folder: &str,
+    uid: u32,
+    budget: std::time::Duration,
+) -> anyhow::Result<parse::Message> {
     if let Some(msg) = read_cached(engine, account, folder, uid) {
         return Ok(msg);
     }
@@ -174,28 +184,66 @@ pub async fn read_cached_or_fetch(
         store::remote_image_policy(&db, account).unwrap_or_default()
     };
 
-    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
-    let mut message = engine
-        .with_transfer_session(account, INLINE_BODY_BUDGET, |session| {
-            let account = account.to_string();
-            let folder = folder.to_string();
-            let media_root = media_root.clone();
-            Box::pin(async move {
-                let media = parse::MediaCtx {
-                    root: media_root,
-                    account,
-                    folder: folder.clone(),
-                    uid,
-                };
-                imap::read_message(session, &folder, uid, &media).await
-            })
-        })
-        .await?;
-
-    {
-        let db = engine.db.lock().unwrap();
-        let _ = store::save_cached_message(&db, account, folder, uid, &message);
+    // A background fill already has this message: wait for it instead of
+    // downloading the same body beside it. The wait comes out of the same
+    // budget as the download below, which is for the whole call.
+    let started = tokio::time::Instant::now();
+    let key = message_key(account, folder, uid);
+    let filled = tokio::time::timeout(budget, async {
+        loop {
+            let done = engine.body_fetch_done.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            if !engine.body_fetches.lock().unwrap().contains(&key) {
+                break;
+            }
+            done.await;
+        }
+    })
+    .await;
+    if filled.is_err() {
+        anyhow::bail!("message body download is still in progress");
     }
+    if let Some(msg) = read_cached(engine, account, folder, uid) {
+        return Ok(msg);
+    }
+    // This read asks the server itself, so what a fill found earlier is moot.
+    engine.take_body_failure(&key);
+    let _snapshot_guard = MessageSyncGuard::begin(engine)?;
+    let wanted = std::collections::BTreeMap::from([(folder.to_string(), vec![uid])]);
+    let fetched = fetch_bodies_keeping_partial(
+        engine,
+        account,
+        &wanted,
+        &media_root,
+        TransferLimits::within(budget.saturating_sub(started.elapsed())),
+    )
+    .await;
+    let mut message = match fetched
+        .messages
+        .into_iter()
+        .find(|(f, id, _)| f == folder && *id == uid)
+    {
+        Some((_, _, message)) => message,
+        None => {
+            let error = fetched
+                .result
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("message uid {uid} not found in {folder}"));
+            // Only a download that ran out of time is helped by the longer
+            // background allowance; the next read waits on it.
+            if error.is::<TransferTimedOut>() {
+                crate::thread_read::spawn_fill_thread_bodies(
+                    engine,
+                    account,
+                    vec![(folder.to_string(), uid)],
+                    media_root,
+                    None,
+                );
+            }
+            return Err(error);
+        }
+    };
 
     attach_html(&mut message, &remote_policy);
     Ok(message)
@@ -218,5 +266,59 @@ pub fn attach_html(message: &mut parse::Message, policy: &store::RemoteImagePoli
             allowed,
             &message.subject,
         ));
+    }
+}
+
+#[cfg(test)]
+mod body_read_tests {
+    use super::*;
+    #[tokio::test]
+    async fn timed_out_single_read_finishes_in_background_without_duplicate_retries() {
+        let (engine, server) = super::super::prefetch::transfer_clock_tests::slow_fetch_engine(
+            2,
+            std::time::Duration::from_millis(25),
+            false,
+        )
+        .await;
+        let err = read_cached_or_fetch_with_budget(
+            &engine,
+            "acc",
+            "INBOX",
+            1,
+            std::time::Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.is::<TransferTimedOut>());
+        assert!(
+            engine
+                .body_fetches
+                .lock()
+                .unwrap()
+                .contains(&message_key("acc", "INBOX", 1))
+        );
+        // Too short to see the fill through: reported, not fetched again.
+        let err = read_cached_or_fetch_with_budget(
+            &engine,
+            "acc",
+            "INBOX",
+            1,
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("still in progress"));
+        // The next read waits for the fill and returns what it cached.
+        let message = read_cached_or_fetch_with_budget(
+            &engine,
+            "acc",
+            "INBOX",
+            1,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert_eq!(message.body.trim(), "Slow body");
+        server.await.unwrap();
     }
 }
