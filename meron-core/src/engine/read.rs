@@ -201,9 +201,9 @@ pub async fn read_cached_or_fetch(
     Ok(message)
 }
 
-/// How long an on-demand body download may run once the socket has answered.
-/// Inside the desktop bridge's 30s budget, and long enough that a slow server
-/// is not abandoned and fetched a second time.
+/// How long an on-demand body download may take, reconnect included. Inside
+/// the desktop bridge's 30s budget, and long enough that a slow server is not
+/// abandoned and fetched a second time.
 pub const INLINE_BODY_BUDGET: std::time::Duration = std::time::Duration::from_secs(25);
 
 /// Turn the stored HTML source into the iframe-ready `body_html` the reader's HTML

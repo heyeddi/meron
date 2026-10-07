@@ -409,12 +409,17 @@ export function frameCanvas(
   /** False where the frame's own background already suits the message — a light
    *  bubble under a light design — which still has to undo an earlier restore. */
   wantsCanvas = true,
+  preparedBackground?: { background: string | null },
 ): FrameCanvas {
   const declared = declaredCanvas(doc)
   const isImportant = (property: string) => declared.important.includes(property)
   writeBodyDeclarations(doc, [['color', declared.text, isImportant('color')]])
 
-  const background = wantsCanvas ? frameCanvasBackground(doc, appearance) : null
+  const background = preparedBackground
+    ? preparedBackground.background
+    : wantsCanvas
+      ? frameCanvasBackground(doc, appearance)
+      : null
   const restoresDeclared = !!background && background === declared.background
   // The canvas is painted on the body itself rather than from the frame's
   // stylesheet. A stylesheet declaration is in the cascade whether or not the
@@ -436,7 +441,7 @@ export function frameCanvas(
   }
 }
 
-// Text the sender hides// Text the sender hides — the preheader every newsletter opens with, a
+// Text the sender hides — the preheader every newsletter opens with, a
 // screen-reader-only line — is not what the message looks like, so it can't be
 // what decides the canvas.
 function isHidden(style: CSSStyleDeclaration): boolean {
@@ -462,39 +467,58 @@ function isHidden(style: CSSStyleDeclaration): boolean {
  * its own length, so the colors that cover the message decide it, and the ones
  * on a hidden preheader or an empty wrapper decide nothing.
  */
-function declaredTextTone(doc: Document): 'light' | 'dark' | null {
+function* textToneWalk(doc: Document): Generator<void, 'light' | 'dark' | null> {
   const win = doc.defaultView
-  // A document that was only parsed has no engine to ask, and no rendering to
-  // describe. Callers treat null as "nothing declared", which is the safe read.
-  if (!win) return null
-
+  if (!win || !doc.body) return null
   let light = 0
   let dark = 0
-  const walk = (el: Element) => {
-    if (SKIPPED_TAGS.has(el.tagName)) return
+  const pending: Element[] = [doc.body]
+  while (pending.length) {
+    const el = pending.pop()!
+    yield
+    if (SKIPPED_TAGS.has(el.tagName)) continue
     const style = win.getComputedStyle(el)
-    if (isHidden(style)) return
-
+    if (isHidden(style)) continue
     const tone = colorTone(style.color)
     for (const node of el.childNodes) {
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        walk(node as Element)
-        continue
+      if (node.nodeType === Node.ELEMENT_NODE) pending.push(node as Element)
+      else if (node.nodeType === Node.TEXT_NODE && tone) {
+        const length = node.textContent?.trim().length ?? 0
+        if (tone === 'light') light += length
+        else dark += length
       }
-      if (node.nodeType !== Node.TEXT_NODE || !tone) continue
-      // Only the text this element paints itself: a child's runs are counted
-      // with the child, in whatever color it resolves to.
-      const length = node.textContent?.trim().length ?? 0
-      if (tone === 'light') light += length
-      else dark += length
     }
   }
-  if (doc.body) walk(doc.body)
+  return !light && !dark ? null : light > dark ? 'dark' : 'light'
+}
 
-  if (!light && !dark) return null
-  // Text lighter than the canvas it never declared means the sender assumed a
-  // dark one, so the tone the *canvas* wants is the opposite of the text's.
-  return light > dark ? 'dark' : 'light'
+// Give input and paint a turn between small batches of computed-style reads.
+async function runThemeWalk<T>(walk: Generator<void, T>, cancelled: () => boolean): Promise<T | undefined> {
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+  let slice = performance.now()
+  while (!cancelled()) {
+    const step = walk.next()
+    if (step.done) return step.value
+    if (performance.now() - slice >= 4) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+      slice = performance.now()
+    }
+  }
+  return undefined
+}
+
+export async function frameCanvasAsync(
+  doc: Document,
+  appearance: Appearance,
+  fallbackText: string,
+  wantsCanvas: boolean,
+  cancelled: () => boolean,
+): Promise<FrameCanvas | undefined> {
+  const declared = declaredCanvas(doc)
+  writeBodyDeclarations(doc, [['color', declared.text, declared.important.includes('color')]])
+  const background = wantsCanvas ? await runThemeWalk(canvasBackgroundWalk(doc, appearance), cancelled) : null
+  if (cancelled()) return undefined
+  return frameCanvas(doc, appearance, fallbackText, wantsCanvas, { background: background ?? null })
 }
 
 /**
@@ -507,7 +531,7 @@ function declaredTextTone(doc: Document): 'light' | 'dark' | null {
  * that declares only light text was written for a dark canvas and already has
  * one — the frame's — so it keeps it.
  */
-export function frameCanvasBackground(doc: Document, appearance: Appearance): string | null {
+function* canvasBackgroundWalk(doc: Document, appearance: Appearance): Generator<void, string | null> {
   const { background } = declaredCanvas(doc)
   // A canvas whose color can't be judged can't be paired with a readable
   // foreground either, so it is treated as no canvas at all and falls through to
@@ -515,7 +539,14 @@ export function frameCanvasBackground(doc: Document, appearance: Appearance): st
   if (background && colorTone(background)) return background
   if (appearance === 'light') return null
   if (!messageIsSelfStyled(doc)) return null
-  return declaredTextTone(doc) === 'dark' ? null : '#ffffff'
+  return (yield* textToneWalk(doc)) === 'dark' ? null : '#ffffff'
+}
+
+export function frameCanvasBackground(doc: Document, appearance: Appearance): string | null {
+  const walk = canvasBackgroundWalk(doc, appearance)
+  let step = walk.next()
+  while (!step.done) step = walk.next()
+  return step.value
 }
 
 /**
@@ -584,11 +615,25 @@ function isBackgroundPicture(el: HTMLElement): boolean {
 }
 
 /** Mark or unmark a frame's document as darkened (see `DARKENED_CSS`). */
-export function setDarkened(doc: Document, darkened: boolean) {
+function* darkenedWalk(doc: Document, darkened: boolean): Generator<void, void> {
   doc.documentElement.toggleAttribute(DARKENED_ATTR, darkened)
-  for (const el of doc.querySelectorAll(`[${PICTURE_ATTR}]`)) el.removeAttribute(PICTURE_ATTR)
+  for (const el of doc.querySelectorAll(`[${PICTURE_ATTR}]`)) {
+    el.removeAttribute(PICTURE_ATTR)
+    yield
+  }
   if (!darkened || !doc.body) return
   for (const el of doc.body.querySelectorAll<HTMLElement>('*')) {
     if (isBackgroundPicture(el)) el.setAttribute(PICTURE_ATTR, '')
+    yield
   }
+}
+
+export function setDarkened(doc: Document, darkened: boolean) {
+  for (const _ of darkenedWalk(doc, darkened)) {
+    /* finish synchronously for reader callers */
+  }
+}
+
+export async function setDarkenedAsync(doc: Document, darkened: boolean, cancelled: () => boolean) {
+  await runThemeWalk(darkenedWalk(doc, darkened), cancelled)
 }

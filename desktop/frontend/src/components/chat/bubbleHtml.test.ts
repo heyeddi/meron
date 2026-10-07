@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'bun:test'
-import { applyBubbleTheme, prepareBubbleHtml, reloadFailedImages, reserveImageBoxes } from './bubbleHtml'
+import {
+  applyBubbleTheme,
+  prepareBubbleHtml,
+  reloadFailedImages,
+  reserveImageBox,
+  releaseFailedImageBox,
+  restoreImageBox,
+  applyBubbleThemeAsync,
+} from './bubbleHtml'
 import {
   DARKENED_ATTR,
   DEFAULT_BUBBLE_THEME,
@@ -214,22 +222,6 @@ describe('prepareBubbleHtml', () => {
       expect(style.canvas()).toBe('')
     })
 
-    it('reserves a box for an image that declares its size', () => {
-      const doc = new DOMParser().parseFromString(
-        prepareBubbleHtml(
-          '<img width="600" height="400" src="https://cdn.example/hero.png"><img width="100%" height="40" src="https://cdn.example/bar.png"><p>After</p>',
-        ),
-        'text/html',
-      )
-
-      reserveImageBoxes(doc)
-
-      const [hero, bar] = [...doc.querySelectorAll('img')]
-      expect(hero?.style.aspectRatio).toBe('auto 600 / 400')
-      // A percentage width is not a length the box can be built from.
-      expect(bar?.style.aspectRatio).toBe('')
-    })
-
     it('ignores a stylesheet that arrived claiming to be the frame stylesheet', () => {
       const html =
         '<html><head><style data-meron-frame-style="stolen">p{color:red}</style></head><body><p>Hi</p></body></html>'
@@ -239,6 +231,23 @@ describe('prepareBubbleHtml', () => {
       expect(marked).toHaveLength(1)
       expect(marked[0]?.getAttribute(FRAME_STYLE_MARKER)).not.toBe('stolen')
       expect(marked[0]?.textContent).toContain('overflow-wrap')
+    })
+
+    it('holds the place of a picture that declares its size', () => {
+      const doc = new DOMParser().parseFromString(
+        '<img width="600" height="400" src="a.png"><img width="100%" height="40" src="b.png"><img width="600" height="400" style="aspect-ratio: 1 / 1" src="c.png">',
+        'text/html',
+      )
+      const [sized, relative, styled] = [...doc.querySelectorAll('img')]
+
+      expect(reserveImageBox(sized!)).toBe(true)
+      expect(sized?.style.aspectRatio).toBe('auto 600 / 400')
+      // A percentage is not a length the box can be built from.
+      expect(reserveImageBox(relative!)).toBe(false)
+      expect(relative?.style.aspectRatio).toBe('')
+      // The sender's own box is the sender's.
+      expect(reserveImageBox(styled!)).toBe(false)
+      expect(styled?.style.aspectRatio).toBe('1 / 1')
     })
 
     it('asks again only for pictures that failed', () => {
@@ -263,6 +272,30 @@ describe('prepareBubbleHtml', () => {
 
       expect(requested).toEqual(['failed'])
       expect(doc.getElementById('failed')?.getAttribute('src')).toBe('/media/a/1/0.png')
+    })
+
+    it('retries a pending picture once if its error arrives after recovery', () => {
+      const doc = new DOMParser().parseFromString('<img src="/media/a/1/0.png">', 'text/html')
+      const image = doc.querySelector('img')!
+      Object.defineProperty(image, 'complete', { value: false })
+      Object.defineProperty(image, 'naturalWidth', { value: 0 })
+      let requests = 0
+      const setAttribute = image.setAttribute.bind(image)
+      image.setAttribute = (name, value) => {
+        if (name === 'src') requests++
+        setAttribute(name, value)
+      }
+      reloadFailedImages(doc)
+      reloadFailedImages(doc)
+      expect(requests).toBe(0)
+      image.dispatchEvent(new Event('error'))
+      expect(requests).toBe(1)
+      image.dispatchEvent(new Event('error'))
+      expect(requests).toBe(1)
+      reloadFailedImages(doc)
+      image.dispatchEvent(new Event('load'))
+      image.dispatchEvent(new Event('error'))
+      expect(requests).toBe(1)
     })
 
     // What the core hands over: its shell, its baked CSP, then the message.
@@ -384,4 +417,69 @@ describe('dark message bodies in a bubble', () => {
     const rule = css.match(new RegExp(`html\\[${DARKENED_ATTR}\\]\\s*\\{([^}]*)\\}`))
     expect(rule?.[1]).toMatch(/background:\s*rgba\(0,\s*0,\s*0,\s*0\.\d+\)\s*!important/)
   })
+})
+
+describe('media sizing and asynchronous theming', () => {
+  it('releases browser-derived dimensions and sender minimum sizes on failed images', () => {
+    const doc = new DOMParser().parseFromString(
+      '<img width="600" height="400" style="aspect-ratio:auto 600 / 400; min-height:400px; width:600px" src="missing.png">',
+      'text/html',
+    )
+    const image = doc.querySelector('img')!
+    releaseFailedImageBox(image)
+    expect(image.hasAttribute('width')).toBe(false)
+    expect(image.hasAttribute('height')).toBe(false)
+    expect(image.style.aspectRatio).toBe('auto')
+    expect(image.style.width).toBe('auto')
+    expect(image.style.minHeight).toBe('0')
+    expect(image.style.getPropertyPriority('aspect-ratio')).toBe('important')
+  })
+
+  it('reserves dimensioned videos too', () => {
+    const doc = new DOMParser().parseFromString('<video width="600" height="400"></video>', 'text/html')
+    const video = doc.querySelector('video')!
+    expect(reserveImageBox(video)).toBe(true)
+    expect(video.style.aspectRatio).toBe('auto 600 / 400')
+  })
+
+  it('finishes the same theme asynchronously and allows a cancelled walk to stop', async () => {
+    const html = prepareBubbleHtml('<p style="color:black">Newsletter</p>')
+    const sync = new DOMParser().parseFromString(html, 'text/html')
+    const asyncDoc = new DOMParser().parseFromString(html, 'text/html')
+    const theme = { ...DEFAULT_BUBBLE_THEME, appearance: 'dark' as const, darkenStyled: true }
+    applyBubbleTheme(sync, theme)
+    await applyBubbleThemeAsync(asyncDoc, theme, () => false)
+    expect(asyncDoc.documentElement.outerHTML).toBe(sync.documentElement.outerHTML)
+    const cancelled = new DOMParser().parseFromString(html, 'text/html')
+    await applyBubbleThemeAsync(cancelled, theme, () => true)
+    expect(cancelled.documentElement.hasAttribute(DARKENED_ATTR)).toBe(false)
+    expect(cancelled.documentElement.style.colorScheme).toBe('')
+  })
+})
+
+it('restores authored dimensions and priorities after a failed image recovers', () => {
+  const doc = new DOMParser().parseFromString(
+    '<img width="80" height="40" style="width:80px!important;min-height:40px;aspect-ratio:2 / 1"><img style="color:red">',
+    'text/html',
+  )
+  const [sized, unsized] = [...doc.querySelectorAll('img')]
+  const dimensions = (image: HTMLImageElement) => [
+    image.getAttribute('width'),
+    image.getAttribute('height'),
+    ...['width', 'height', 'min-width', 'min-height', 'aspect-ratio'].map((name) => [
+      image.style.getPropertyValue(name),
+      image.style.getPropertyPriority(name),
+    ]),
+  ]
+  for (const image of [sized!, unsized!]) {
+    const before = dimensions(image)
+    releaseFailedImageBox(image)
+    releaseFailedImageBox(image)
+    image.style.color = 'blue'
+    restoreImageBox(image)
+    expect(dimensions(image)).toEqual(before)
+    expect(image.style.color).toBe('blue')
+    restoreImageBox(image)
+    expect(dimensions(image)).toEqual(before)
+  }
 })

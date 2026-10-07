@@ -5,6 +5,7 @@ import { thread$ } from '../../states/thread'
 import type { Message } from '../../types'
 import { fileIconFor, formatFileSize, mediaSrc } from './messageHelpers'
 import { MessageBubbleBody } from './MessageBubbleBody'
+import { RetryWhenRestored } from './RetryWhenRestored'
 import { VideoAttachment } from './VideoAttachment'
 import type { MessageView } from './useMessageView'
 
@@ -76,12 +77,14 @@ export function MessageContent({
                   className={`block w-full overflow-hidden hover:opacity-90 cursor-pointer ${btnClass}`}
                   title={image.filename}
                 >
-                  <img
-                    src={mediaSrc(image)}
-                    alt={image.filename}
-                    loading="lazy"
-                    className="w-full h-full object-cover object-top"
-                  />
+                  <RetryWhenRestored mediaMissing={message.media_missing ?? 0}>
+                    <img
+                      src={mediaSrc(image)}
+                      alt={image.filename}
+                      loading="lazy"
+                      className="w-full h-full object-cover object-top"
+                    />
+                  </RetryWhenRestored>
                 </button>
               ))}
             </div>
@@ -95,12 +98,13 @@ export function MessageContent({
       {videos.length > 0 && (
         <div className="mb-2 flex flex-col gap-1.5">
           {videos.map((video, idx) => (
-            <VideoAttachment
-              key={idx}
-              src={mediaSrc(video)}
-              externalUrl={video.url ?? mediaSrc(video)}
-              externalLabel={t('chat.openExternalPlayer')}
-            />
+            <RetryWhenRestored key={idx} mediaMissing={message.media_missing ?? 0}>
+              <VideoAttachment
+                src={mediaSrc(video)}
+                externalUrl={video.url ?? mediaSrc(video)}
+                externalLabel={t('chat.openExternalPlayer')}
+              />
+            </RetryWhenRestored>
           ))}
         </div>
       )}

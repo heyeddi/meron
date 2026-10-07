@@ -228,6 +228,8 @@ data class MessageBody(
     // locally (an optimistic send bubble) or by a version before the core sent
     // it.
     val reply: MessageReply? = null,
+    // Files the core is restoring in the background; a decrease retries failed images.
+    val mediaMissing: Int = 0,
 )
 
 data class DraftAttachment(

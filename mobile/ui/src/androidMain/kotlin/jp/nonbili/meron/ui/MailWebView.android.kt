@@ -15,6 +15,7 @@ import android.webkit.WebViewClient
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
@@ -49,7 +50,9 @@ actual fun MailWebView(
     onQuoteToggle: (Boolean) -> Unit,
     onNaturalWidth: (Dp) -> Unit,
     onOverflowExtent: (Int, Int) -> Unit,
+    mediaMissing: Int,
 ) {
+    val mediaRecovery = remember { MailMediaRecovery(mediaMissing) }
     val latestOnOverflowExtent = rememberUpdatedState(onOverflowExtent)
     val latestOnNaturalWidth = rememberUpdatedState(onNaturalWidth)
     val latestOnQuoteToggle = rememberUpdatedState(onQuoteToggle)
@@ -85,6 +88,13 @@ actual fun MailWebView(
             LongPressWebView(context).apply {
                 webViewClient =
                     object : WebViewClient() {
+                        override fun onPageFinished(
+                            view: WebView?,
+                            url: String?,
+                        ) {
+                            view?.retryRecoveredMedia(mediaRecovery)
+                        }
+
                         override fun shouldOverrideUrlLoading(
                             view: WebView?,
                             request: WebResourceRequest?,
@@ -255,12 +265,20 @@ actual fun MailWebView(
             // Both ways explicitly, as with the settings above: the view is
             // retained, and white is WebView's own default.
             webView.setBackgroundColor(if (transparentBackground) Color.TRANSPARENT else Color.WHITE)
-            if (webView.tag != html) {
+            val documentChanged = webView.tag != html
+            mediaRecovery.update(mediaMissing, documentChanged)
+            if (documentChanged) {
                 webView.tag = html
-                webView.loadDataWithBaseURL(MAIL_WEB_VIEW_ORIGIN, html, "text/html", "UTF-8", null)
+                webView.loadDataWithBaseURL(MAIL_WEB_VIEW_ORIGIN, mailHtmlWithMediaGeneration(html, mediaRecovery.generation), "text/html", "UTF-8", null)
             }
+            webView.retryRecoveredMedia(mediaRecovery)
         },
     )
+}
+
+private fun WebView.retryRecoveredMedia(recovery: MailMediaRecovery) {
+    val request = recovery.request() ?: return
+    evaluateJavascript(request.script) { result -> recovery.acknowledge(request, result == "true") }
 }
 
 internal fun localMailMediaResponse(

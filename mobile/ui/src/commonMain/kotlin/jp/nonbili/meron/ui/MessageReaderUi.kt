@@ -412,6 +412,7 @@ internal fun MessageReaderScreen(
                         // same mail as an unreadable thumbnail.
                         HtmlMessageBody(
                             html = message.bodyHtml,
+                            mediaMissing = message.mediaMissing,
                             quoteKey = message.id,
                             allowRemote = remoteContent.allowRemote,
                             onOpenUrl = onOpenUrl,
@@ -433,6 +434,7 @@ internal fun MessageReaderScreen(
                         if (visibleImages.isNotEmpty()) {
                             AttachmentImageGrid(
                                 images = visibleImages,
+                                mediaMissing = message.mediaMissing,
                                 loadImageAttachment = loadImageAttachment,
                                 onOpen = onOpenImageAttachment,
                             )

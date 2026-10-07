@@ -1,5 +1,6 @@
 //! Background body prefetch so recent mail is readable offline.
 
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,13 +19,13 @@ pub const PREFETCH_DAYS: u32 = 14;
 /// handshake.
 const PREFETCH_BATCH: usize = imap::BODY_FETCH_BATCH;
 
-/// Downloads that may fail in a row before a run gives up. A dead connection
-/// fails every attempt; a message that cannot be downloaded fails only its own.
+/// Downloads that may fail in a row before a run stops to check whether
+/// anything can be downloaded at all.
 const PREFETCH_MAX_FAILURES: usize = 3;
 
-/// One batch is a few full messages. Long enough for a slow server, short
-/// enough that a dead socket is not held for the whole backlog.
-const PREFETCH_BATCH_BUDGET: Duration = Duration::from_secs(120);
+/// How long a prefetch download may go without a message arriving. A stall is
+/// what a dead socket looks like; a large message is given this long to land.
+const PREFETCH_IDLE: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Debug)]
 pub struct BodyPrefetchOptions {
@@ -85,83 +86,363 @@ pub async fn prefetch_bodies_with_options(
         .await?;
     let pending: Vec<u32> = {
         let db = engine.db.lock().unwrap();
-        uids.into_iter()
+        let wanted: Vec<u32> = uids
+            .into_iter()
             .filter(|uid| {
                 store::has_message(&db, account, folder, *uid).unwrap_or(false)
                     && !store::has_cached_body(&db, account, folder, *uid).unwrap_or(false)
             })
+            .collect();
+        // Only mail that is still waiting stays on the list: not once the
+        // on-demand reader cached it, it left the window, or it was deleted.
+        let mut skipped = engine.prefetch_skipped.lock().unwrap();
+        let ours = folder_key_prefix(account, folder);
+        skipped.retain(|key| {
+            key.strip_prefix(ours.as_str())
+                .and_then(|uid| uid.parse::<u32>().ok())
+                .is_none_or(|uid| wanted.contains(&uid))
+        });
+        wanted
+            .into_iter()
+            .filter(|uid| !skipped.contains(&message_key(account, folder, *uid)))
             .collect()
     };
     let pending = limit_prefetch_uids(pending, options.max_count);
+    let run = PrefetchRun {
+        engine,
+        account,
+        folder,
+        media_root: &options.media_root,
+    };
 
+    // Newest first. A batch that fails hands what it did not deliver to
+    // `singles`, to be taken one message at a time ahead of the next batch.
+    let mut queue: VecDeque<u32> = pending.into();
+    let mut singles: VecDeque<u32> = VecDeque::new();
+    let mut blame = Blame::default();
     let mut fetched = 0usize;
     let mut failures = 0usize;
-    'backlog: for chunk in pending.chunks(PREFETCH_BATCH) {
+    let mut probed = false;
+    loop {
         if failures >= PREFETCH_MAX_FAILURES {
-            break;
-        }
-        match prefetch_batch(engine, account, folder, chunk, &options.media_root).await {
-            Ok(saved) => {
-                fetched += saved;
-                failures = 0;
-                continue;
-            }
-            Err(e) => {
-                eprintln!("meron-core: prefetch {folder}: {e:#}");
-                failures += 1;
-            }
-        }
-        // Nothing from a failed batch is saved, and the order never changes, so
-        // one message that cannot be downloaded would fail the same batch on
-        // every run and keep everything older cold. Take the batch one message
-        // at a time, and carry on past the one that fails.
-        for uid in chunk {
-            if failures >= PREFETCH_MAX_FAILURES {
-                break 'backlog;
-            }
-            if chunk.len() == 1 {
+            // Nothing but failures: an expired login, a folder that is gone or
+            // a dead network — or the newest few messages all being ones that
+            // cannot be downloaded. One message from the far end of the backlog
+            // tells them apart, once. If it arrives the run goes on.
+            let Some(probe) = queue.pop_back().filter(|_| !probed) else {
+                break;
+            };
+            probed = true;
+            let (saved, result) = run.download(&[probe]).await;
+            fetched += saved.len();
+            if result.is_err() {
                 break;
             }
-            match prefetch_batch(engine, account, folder, &[*uid], &options.media_root).await {
-                Ok(saved) => {
-                    fetched += saved;
+            failures = 0;
+            fetched += run.after_success(&mut blame).await;
+            continue;
+        }
+        if let Some(uid) = singles.pop_front() {
+            let (saved, result) = run.download(&[uid]).await;
+            fetched += saved.len();
+            match result {
+                Ok(()) => {
                     failures = 0;
+                    fetched += run.after_success(&mut blame).await;
                 }
-                Err(e) => {
-                    eprintln!("meron-core: prefetch {folder} uid {uid}: {e:#}");
+                Err(err) => {
+                    eprintln!("meron-core: prefetch {folder} uid {uid}: {err:#}");
                     failures += 1;
+                    if prefetch_failure_is_the_messages(&err) {
+                        blame.suspects.push(uid);
+                    }
                 }
             }
+            continue;
+        }
+        let chunk: Vec<u32> = queue.drain(..queue.len().min(PREFETCH_BATCH)).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let (saved, result) = run.download(&chunk).await;
+        fetched += saved.len();
+        let Err(err) = result else {
+            failures = 0;
+            fetched += run.after_success(&mut blame).await;
+            continue;
+        };
+        eprintln!("meron-core: prefetch {folder}: {err:#}");
+        // Part of a batch arriving means the account works, but the link has
+        // just failed: not the moment to judge anything by.
+        if saved.is_empty() {
+            failures += 1;
+        } else {
+            failures = 0;
+        }
+        if chunk.len() > 1 {
+            // What arrived before the failure is kept. The order never changes,
+            // so one message that cannot be downloaded would fail the same
+            // batch on every run and keep everything older cold.
+            singles.extend(chunk.iter().filter(|uid| !saved.contains(uid)));
+        } else if prefetch_failure_is_the_messages(&err) {
+            blame.suspects.push(chunk[0]);
         }
     }
     Ok(fetched)
 }
 
-/// Download and cache `uids` on one session checkout; how many were saved.
+/// What a run holds against messages, short of skipping them.
+///
+/// A failure on its own proves nothing: a stalled network fails every message
+/// it touches. A message is only skipped once it has failed, failed again
+/// straight after a clean download, and a clean download has followed that —
+/// working mail on both sides of its second failure.
+#[derive(Default)]
+struct Blame {
+    /// Failed once on their own, for a reason that may be theirs.
+    suspects: Vec<u32>,
+    /// Failed again when retried after a clean download.
+    failed_twice: Vec<u32>,
+}
+
+/// Whether a failed download may be the message's own doing. A connection that
+/// went away is not. An error the server reported, or a download that stalled,
+/// may be — or may be the account or the network, which is why it only makes
+/// the message a suspect (see [`PrefetchRun::recheck`]).
+pub(super) fn prefetch_failure_is_the_messages(err: &anyhow::Error) -> bool {
+    err.is::<TransferTimedOut>() || !background_sync::is_transient_sync_error(err)
+}
+
+struct PrefetchRun<'a> {
+    engine: &'a Arc<Engine>,
+    account: &'a str,
+    folder: &'a str,
+    media_root: &'a std::path::Path,
+}
+
+impl PrefetchRun<'_> {
+    /// Download and cache `uids` on one session checkout. Returns the UIDs
+    /// saved, which on a failure are the ones that arrived before it.
+    async fn download(&self, uids: &[u32]) -> (Vec<u32>, anyhow::Result<()>) {
+        prefetch_batch(
+            self.engine,
+            self.account,
+            self.folder,
+            uids,
+            self.media_root,
+        )
+        .await
+    }
+
+    /// Called straight after a download completed cleanly, the one moment
+    /// the account, the folder and the network are known to be fine. Returns
+    /// how many suspects arrived after all.
+    async fn after_success(&self, blame: &mut Blame) -> usize {
+        // Their second failure now has a clean download after it as well.
+        if !blame.failed_twice.is_empty() {
+            let mut skipped = self.engine.prefetch_skipped.lock().unwrap();
+            for uid in blame.failed_twice.drain(..) {
+                skipped.insert(message_key(self.account, self.folder, uid));
+            }
+        }
+        let mut arrived = 0;
+        for uid in std::mem::take(&mut blame.suspects) {
+            let (saved, result) = self.download(&[uid]).await;
+            arrived += saved.len();
+            if let Err(err) = result
+                && prefetch_failure_is_the_messages(&err)
+            {
+                blame.failed_twice.push(uid);
+            }
+        }
+        arrived
+    }
+}
+
+/// Download and cache `uids` on one session checkout. Returns the UIDs saved,
+/// which on a failure are the ones that arrived before it.
 async fn prefetch_batch(
     engine: &Arc<Engine>,
     account: &str,
     folder: &str,
     uids: &[u32],
     media_root: &std::path::Path,
-) -> anyhow::Result<usize> {
-    let messages = engine
-        .with_transfer_session(account, PREFETCH_BATCH_BUDGET, |session| {
-            let folder = folder.to_string();
-            let account = account.to_string();
-            let uids = uids.to_vec();
-            let media_root = media_root.to_path_buf();
-            Box::pin(async move {
-                // peek via fetch_bodies: warming must not flip unread mail to read.
-                imap::fetch_bodies(session, &folder, &uids, media_root, &account).await
-            })
-        })
-        .await?;
+) -> (Vec<u32>, anyhow::Result<()>) {
+    let wanted = BTreeMap::from([(folder.to_string(), uids.to_vec())]);
+    let fetched = fetch_bodies_keeping_partial(
+        engine,
+        account,
+        &wanted,
+        media_root,
+        TransferLimits {
+            idle: PREFETCH_IDLE,
+            total: PREFETCH_IDLE * uids.len().max(1) as u32,
+        },
+    )
+    .await;
     let db = engine.db.lock().unwrap();
-    for (uid, message) in &messages {
-        let _ = store::save_cached_message(&db, account, folder, *uid, message);
+    let saved = fetched
+        .messages
+        .iter()
+        .map(|(_, uid, message)| {
+            let _ = store::save_cached_message(&db, account, folder, *uid, message);
+            *uid
+        })
+        .collect();
+    (saved, fetched.result)
+}
+
+/// How long a body download may run.
+#[derive(Clone, Copy)]
+pub(crate) struct TransferLimits {
+    /// The longest the transfer may go without a message arriving, from the
+    /// moment it starts and after each one. This is what ends a download on a
+    /// socket that has gone silent, and it has to be long enough for the
+    /// largest message to land. Connecting is not on this clock.
+    pub idle: Duration,
+    /// The longest the call may take altogether, connecting included, however
+    /// steadily mail arrives.
+    pub total: Duration,
+}
+
+impl TransferLimits {
+    /// One allowance for the whole download: for a caller that is waiting.
+    pub fn within(total: Duration) -> Self {
+        Self { idle: total, total }
     }
-    Ok(messages.len())
+}
+
+/// What [`fetch_bodies_keeping_partial`] came back with.
+pub(crate) struct PartialBodies {
+    /// `(folder, uid, message)` for everything that arrived, also when the
+    /// download then failed or ran out of time.
+    pub messages: Vec<(String, u32, parse::Message)>,
+    /// The folders a download was actually started for. A message asked for in
+    /// one of these and not in `messages` was not delivered; one in any other
+    /// folder was never tried.
+    pub attempted: HashSet<String>,
+    pub result: anyhow::Result<()>,
+}
+
+#[derive(Default)]
+struct TransferProgress {
+    messages: Vec<(String, u32, parse::Message)>,
+    attempted: HashSet<String>,
+    /// When the transfer last got somewhere: it started, or a message
+    /// arrived. `None` until a session is in hand, so that connecting — and a
+    /// credential refresh — is not on the idle
+    /// clock.
+    last_progress: Option<tokio::time::Instant>,
+}
+
+// Clear the idle clock whenever an operation ends, including errors and
+// cancellation. Reconnection and credential refresh are not transfer stalls.
+struct ActiveTransfer(Arc<std::sync::Mutex<TransferProgress>>);
+
+impl Drop for ActiveTransfer {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().last_progress = None;
+    }
+}
+
+/// Download `wanted` (UIDs by folder) on one session checkout within `limits`,
+/// keeping whatever arrives. A failure or a deadline part-way through keeps
+/// what came before it, so a retry only has the rest to fetch.
+pub(crate) async fn fetch_bodies_keeping_partial(
+    engine: &Engine,
+    account: &str,
+    wanted: &BTreeMap<String, Vec<u32>>,
+    media_root: &std::path::Path,
+    limits: TransferLimits,
+) -> PartialBodies {
+    // Outside the session future: that is dropped when time runs out.
+    let progress: Arc<std::sync::Mutex<TransferProgress>> = Arc::default();
+    let transfer = engine.with_transfer_session(account, limits.total, |session| {
+        let progress = progress.clone();
+        let account = account.to_string();
+        let media_root = media_root.to_path_buf();
+        let db = engine.db.clone();
+        // A second run, after a lost connection, only wants what is left.
+        let remaining: Vec<(String, Vec<u32>)> = {
+            let progress = progress.lock().unwrap();
+            wanted
+                .iter()
+                .map(|(folder, uids)| {
+                    let left =
+                        uids.iter()
+                            .copied()
+                            .filter(|uid| {
+                                !progress.messages.iter().any(|(have_folder, have, _)| {
+                                    have_folder == folder && have == uid
+                                })
+                            })
+                            .collect::<Vec<u32>>();
+                    (folder.clone(), left)
+                })
+                .filter(|(_, left)| !left.is_empty())
+                .collect()
+        };
+        Box::pin(async move {
+            let _active = ActiveTransfer(progress.clone());
+            progress.lock().unwrap().last_progress = Some(tokio::time::Instant::now());
+            for (folder, uids) in remaining {
+                progress.lock().unwrap().attempted.insert(folder.clone());
+                // peek via fetch_bodies: warming must not flip unread mail to read.
+                imap::fetch_bodies(
+                    session,
+                    &folder,
+                    &uids,
+                    media_root.clone(),
+                    &account,
+                    &mut |uid, message| {
+                        // Persist before yielding to the socket again: an outer
+                        // caller timeout can cancel the entire batch at any point.
+                        let _ = store::save_cached_message(
+                            &db.lock().unwrap(),
+                            &account,
+                            &folder,
+                            uid,
+                            &message,
+                        );
+                        let mut progress = progress.lock().unwrap();
+                        progress.messages.push((folder.clone(), uid, message));
+                        progress.last_progress = Some(tokio::time::Instant::now());
+                    },
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    });
+    tokio::pin!(transfer);
+    let result = loop {
+        let last_progress = progress.lock().unwrap().last_progress;
+        // Not transferring yet: nothing to time, look again shortly.
+        let wake = match last_progress {
+            Some(at) => at + limits.idle,
+            None => tokio::time::Instant::now() + Duration::from_secs(1),
+        };
+        tokio::select! {
+            result = &mut transfer => break result,
+            // A message may have arrived while this slept: look again.
+            () = tokio::time::sleep_until(wake) => {
+                let stalled = progress
+                    .lock()
+                    .unwrap()
+                    .last_progress
+                    .is_some_and(|at| at + limits.idle <= tokio::time::Instant::now());
+                if stalled {
+                    break Err(TransferTimedOut(limits.idle).into());
+                }
+            }
+        }
+    };
+    let mut progress = progress.lock().unwrap();
+    PartialBodies {
+        messages: std::mem::take(&mut progress.messages),
+        attempted: std::mem::take(&mut progress.attempted),
+        result,
+    }
 }
 
 /// Fetch and cache the bodies of specific UIDs, skipping any already cached.
@@ -188,25 +469,20 @@ pub async fn fetch_bodies_for_uids(
         return Ok(0);
     }
     let _snapshot_guard = MessageSyncGuard::begin(engine)?;
-    engine
-        .with_transfer_session(account, PREFETCH_BATCH_BUDGET, |session| {
-            let engine = engine.clone();
-            let account = account.to_string();
-            let folder = folder.to_string();
-            let pending = pending.clone();
-            let media_root = media_root.clone();
-            Box::pin(async move {
-                let fetched =
-                    imap::fetch_bodies(session, &folder, &pending, media_root, &account).await?;
-                let count = fetched.len();
-                let db = engine.db.lock().unwrap();
-                for (uid, message) in fetched {
-                    let _ = store::save_cached_message(&db, &account, &folder, uid, &message);
-                }
-                anyhow::Ok(count)
-            })
-        })
-        .await
+    let wanted = BTreeMap::from([(folder.to_string(), pending)]);
+    let fetched = fetch_bodies_keeping_partial(
+        engine,
+        account,
+        &wanted,
+        &media_root,
+        TransferLimits::within(PREFETCH_IDLE),
+    )
+    .await;
+    let db = engine.db.lock().unwrap();
+    for (_, uid, message) in &fetched.messages {
+        let _ = store::save_cached_message(&db, account, folder, *uid, message);
+    }
+    fetched.result.map(|()| fetched.messages.len())
 }
 
 /// Warm a folder's bodies in the background (deduped per account/folder). Stays
@@ -261,4 +537,122 @@ pub fn spawn_files_backfill(engine: Arc<Engine>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod transfer_clock_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ending_an_operation_disarms_the_idle_clock() {
+        let progress: Arc<std::sync::Mutex<TransferProgress>> = Arc::default();
+        let mut operation = Box::pin(async {
+            let _active = ActiveTransfer(progress.clone());
+            progress.lock().unwrap().last_progress = Some(tokio::time::Instant::now());
+            std::future::pending::<()>().await;
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut operation)
+                .await
+                .is_err()
+        );
+        // The timeout only dropped its reference. Dropping the operation is
+        // what disarms the clock before a reconnect starts.
+        assert!(progress.lock().unwrap().last_progress.is_some());
+        drop(operation);
+        assert!(progress.lock().unwrap().last_progress.is_none());
+    }
+    #[tokio::test]
+    async fn cancelled_prefetch_keeps_messages_received_before_the_batch_finishes() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        struct Host;
+        impl EngineHost for Host {
+            fn open_db(&self) -> anyhow::Result<rusqlite::Connection> {
+                store::open_at(":memory:")
+            }
+            fn apply_secret(&self, _: &rusqlite::Connection, _: &str, _: &mut imap::Creds) {}
+            fn store_secret(
+                &self,
+                _: &rusqlite::Connection,
+                _: &str,
+                _: &crate::secrets::Secrets,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            writer.write_all(b"* OK ready\r\n").await.unwrap();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let (tag, command) = line.split_once(' ').unwrap();
+                if command.starts_with("UID FETCH") {
+                    let body = "Message-ID: <one@test>\r\nSubject: One\r\n\r\nFirst body";
+                    writer
+                        .write_all(
+                            format!("* 1 FETCH (UID 1 BODY[] {{{}}}\r\n{body})\r\n", body.len())
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
+                    // The second message and the command completion never arrive.
+                    let _ = released.await;
+                    return;
+                }
+                if command.starts_with("SELECT") {
+                    writer.write_all(b"* 2 EXISTS\r\n").await.unwrap();
+                }
+                writer
+                    .write_all(format!("{tag} OK done\r\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+        });
+        let engine = Arc::new(Engine::new(Box::new(Host)).unwrap());
+        let config = serde_json::json!({"host":"127.0.0.1", "port":port, "tls":false, "user":"u", "proxy":{"mode":"direct"}}).to_string();
+        let creds = {
+            let db = engine.db.lock().unwrap();
+            db.execute(
+                "INSERT INTO accounts(id, config) VALUES('acc', ?1)",
+                [&config],
+            )
+            .unwrap();
+            store::load_account(&db, "acc").unwrap().unwrap()
+        };
+        engine.accounts.lock().await.insert("acc".into(), creds);
+        let worker = tokio::spawn({
+            let engine = engine.clone();
+            async move { prefetch_batch(&engine, "acc", "INBOX", &[1, 2], &std::env::temp_dir()).await }
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if store::has_cached_body(&engine.db.lock().unwrap(), "acc", "INBOX", 1).unwrap() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!worker.is_finished());
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        let db = engine.db.lock().unwrap();
+        assert_eq!(
+            store::get_cached_message(&db, "acc", "INBOX", 1)
+                .unwrap()
+                .unwrap()
+                .body
+                .trim(),
+            "First body"
+        );
+        assert!(!store::has_cached_body(&db, "acc", "INBOX", 2).unwrap());
+        drop(db);
+        let _ = release.send(());
+        server.await.unwrap();
+    }
 }

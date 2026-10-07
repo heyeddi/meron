@@ -47,6 +47,8 @@ expect fun MailWebView(
      *  grows, with the CSS width it was measured at: content escaping the body
      *  that the caller hands back to the next document for the same mail. */
     onOverflowExtent: (extent: Int, width: Int) -> Unit = { _, _ -> },
+    /** Retry failed images when the core restores attachment files. */
+    mediaMissing: Int = 0,
 )
 
 /**
@@ -69,3 +71,83 @@ internal expect val MailWebViewFitsWideContent: Boolean
 /** Whether the reader can pinch [MailWebView] to zoom its page, in which case
  *  the document reports a height that grows with the zoom. */
 internal expect val MailWebViewPinchZooms: Boolean
+
+// Native update and navigation callbacks share this state. A recovery signal
+// stays pending until the matching, parsed document installs its retry hooks.
+internal class MailMediaRecovery(
+    initialMissing: Int,
+) {
+    var generation: Int = 0
+        private set
+    private var missing = initialMissing
+    private var revision = 0
+    private var pending = false
+
+    fun update(
+        nextMissing: Int,
+        documentChanged: Boolean,
+    ) {
+        if (documentChanged) {
+            generation++
+            revision++
+        }
+        if (nextMissing < missing) {
+            pending = true
+            revision++
+        }
+        missing = nextMissing
+    }
+
+    fun request(): MailMediaRecoveryRequest? = if (pending) MailMediaRecoveryRequest(generation, revision) else null
+
+    fun acknowledge(
+        request: MailMediaRecoveryRequest,
+        installed: Boolean,
+    ) {
+        if (installed && request.generation == generation && request.revision == revision) pending = false
+    }
+}
+
+internal data class MailMediaRecoveryRequest(
+    val generation: Int,
+    val revision: Int,
+) {
+    val script: String
+        get() = RetryFailedMailImagesScript.replace("__GENERATION__", generation.toString()).replace("__REVISION__", revision.toString())
+}
+
+internal fun mailHtmlWithMediaGeneration(
+    html: String,
+    generation: Int,
+): String = Regex("(?i)<html(?=\\s|>)").replaceFirst(html, "<html data-meron-media-generation=\"$generation\"")
+
+internal val RetryFailedMailImagesScript =
+    """
+    (function() {
+      if (document.documentElement.getAttribute('data-meron-media-generation') !== '__GENERATION__') return false;
+      var revision = __REVISION__;
+      if (window.__meronMediaRecoveryRevision === revision) return true;
+      window.__meronMediaRecoveryRevision = revision;
+      function install() {
+        if (window.__meronMediaRecoveryRevision !== revision) return;
+        document.querySelectorAll('img[src]').forEach(function(image) {
+          if (image.complete && image.naturalWidth > 0) return;
+          function retry() {
+            if (window.__meronMediaRecoveryRevision !== revision || image.naturalWidth > 0) return;
+            var src = image.getAttribute('src');
+            if (!src) return;
+            image.removeAttribute('src');
+            image.setAttribute('src', src);
+          }
+          if (image.complete) retry();
+          else {
+            image.addEventListener('error', retry, { once: true });
+            image.addEventListener('load', function() { image.removeEventListener('error', retry); }, { once: true });
+          }
+        });
+      }
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', install, { once: true });
+      else install();
+      return true;
+    })();
+    """.trimIndent()

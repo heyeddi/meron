@@ -22,6 +22,8 @@ import platform.UIKit.UIGestureRecognizerStateBegan
 import platform.UIKit.UIGestureRecognizerStateChanged
 import platform.UIKit.UIPanGestureRecognizer
 import platform.UIKit.UIScrollView
+import platform.WebKit.WKNavigation
+import platform.WebKit.WKNavigationDelegateProtocol
 import platform.WebKit.WKScriptMessage
 import platform.WebKit.WKScriptMessageHandlerProtocol
 import platform.WebKit.WKUserContentController
@@ -49,6 +51,7 @@ actual fun MailWebView(
     onQuoteToggle: (Boolean) -> Unit,
     onNaturalWidth: (Dp) -> Unit,
     onOverflowExtent: (Int, Int) -> Unit,
+    mediaMissing: Int,
 ) {
     val latestOnOverflowExtent = rememberUpdatedState(onOverflowExtent)
     val latestOnNaturalWidth = rememberUpdatedState(onNaturalWidth)
@@ -60,6 +63,8 @@ actual fun MailWebView(
     // recomposition (every height report recomposes), and reloading the same
     // page would reset what the reader did in it — an opened quote, for one.
     val loadedHtml = remember { LoadedHtml() }
+    val mediaRecovery = remember { MailMediaRecovery(mediaMissing) }
+    val mediaNavigationDelegate = remember { MediaRecoveryNavigationDelegate(mediaRecovery) }
     // Held here because a gesture recognizer retains neither its target nor
     // its delegate.
     val zoomedPan = remember { ZoomedPanHandler() }
@@ -95,6 +100,7 @@ actual fun MailWebView(
                 name = "meronQuote",
             )
             WKWebView(frame = CGRectMake(0.0, 0.0, 0.0, 0.0), configuration = config).apply {
+                navigationDelegate = mediaNavigationDelegate
                 // Compose owns capped bubble scrolling; the web view is measured
                 // to its full content height so its native scroll view would fight
                 // the parent LazyColumn for vertical drags. Its pinch is a
@@ -111,12 +117,36 @@ actual fun MailWebView(
             }
         },
         update = { webView ->
-            if (loadedHtml.value != html) {
+            val documentChanged = loadedHtml.value != html
+            mediaRecovery.update(mediaMissing, documentChanged)
+            if (documentChanged) {
                 loadedHtml.value = html
-                webView.loadHTMLString(html, baseURL = null)
+                webView.loadHTMLString(mailHtmlWithMediaGeneration(html, mediaRecovery.generation), baseURL = null)
             }
+            webView.retryRecoveredMedia(mediaRecovery)
         },
     )
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun WKWebView.retryRecoveredMedia(recovery: MailMediaRecovery) {
+    val request = recovery.request() ?: return
+    evaluateJavaScript(request.script) { result, error ->
+        recovery.acknowledge(request, error == null && (result as? NSNumber)?.boolValue == true)
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private class MediaRecoveryNavigationDelegate(
+    private val recovery: MailMediaRecovery,
+) : NSObject(),
+    WKNavigationDelegateProtocol {
+    override fun webView(
+        webView: WKWebView,
+        didFinishNavigation: WKNavigation?,
+    ) {
+        webView.retryRecoveredMedia(recovery)
+    }
 }
 
 private class LoadedHtml(

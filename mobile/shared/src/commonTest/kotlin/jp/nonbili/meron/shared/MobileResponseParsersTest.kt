@@ -514,7 +514,7 @@ class MobileResponseParsersTest {
     fun parsesThreadReadEnvelope() {
         val messages =
             parseThreadReadResponse(
-                """{"id":3,"result":{"messages":[{"id":"acc#INBOX#t#9","from_name":"Ada","from_addr":"ada@example.com","to":"Me <me@example.com>","cc":"Copy <copy@example.com>","bcc":"Hidden <hidden@example.com>","subject":"Cached subject","body":"Hello from cache","body_html":"<p>Hello from cache</p>","date":300,"unread":true,"starred":true,"reply_to":"Team <team@example.com>","message_id":"m1@example.com","in_reply_to":"parent@example.com","references":"<root@example.com>","outgoing":true,"has_attachments":true,"attachments":[{"filename":"note.txt","mime":"text/plain","size":2,"key":"acc/INBOX/9/1.txt"},{"filename":"remote.jpg","mime":"image/jpeg","size":0,"url":"https://example.com/remote.jpg"}]}]}}""",
+                """{"id":3,"result":{"messages":[{"id":"acc#INBOX#t#9","from_name":"Ada","from_addr":"ada@example.com","to":"Me <me@example.com>","cc":"Copy <copy@example.com>","bcc":"Hidden <hidden@example.com>","subject":"Cached subject","body":"Hello from cache","body_html":"<p>Hello from cache</p>","media_missing":2,"date":300,"unread":true,"starred":true,"reply_to":"Team <team@example.com>","message_id":"m1@example.com","in_reply_to":"parent@example.com","references":"<root@example.com>","outgoing":true,"has_attachments":true,"attachments":[{"filename":"note.txt","mime":"text/plain","size":2,"key":"acc/INBOX/9/1.txt"},{"filename":"remote.jpg","mime":"image/jpeg","size":0,"url":"https://example.com/remote.jpg"}]}]}}""",
             )
 
         assertEquals(1, messages.size)
@@ -526,6 +526,7 @@ class MobileResponseParsersTest {
         assertEquals("Cached subject", messages[0].subject)
         assertEquals("Hello from cache", messages[0].body)
         assertEquals("<p>Hello from cache</p>", messages[0].bodyHtml)
+        assertEquals(2, messages[0].mediaMissing)
         assertEquals(300, messages[0].dateEpochSeconds)
         assertEquals("ada@example.com", messages[0].fromAddr)
         assertEquals("Team <team@example.com>", messages[0].replyTo)

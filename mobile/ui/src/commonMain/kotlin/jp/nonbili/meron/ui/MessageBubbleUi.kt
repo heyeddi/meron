@@ -669,6 +669,7 @@ internal fun ColumnScope.MessageBodyContent(
         Box(Modifier.then(NoIntrinsicWidth)) {
             HtmlMessageBody(
                 html = message.bodyHtml,
+                mediaMissing = message.mediaMissing,
                 quoteKey = message.id,
                 allowRemote = remoteContent.allowRemote,
                 maxHeight = bodyMaxHeight,
@@ -773,6 +774,7 @@ internal fun ColumnScope.MessageBodyContent(
             if (visibleImages.isNotEmpty()) {
                 AttachmentImageGrid(
                     images = visibleImages,
+                    mediaMissing = message.mediaMissing,
                     loadImageAttachment = loadImageAttachment,
                     onOpen = onOpenImageAttachment,
                     columns = imageColumns,
@@ -937,6 +939,7 @@ internal fun HtmlMessageBody(
     onOpenImage: (String) -> Unit = {},
     fitWideContent: Boolean = false,
     onNaturalWidth: (Dp) -> Unit = {},
+    mediaMissing: Int = 0,
 ) {
     // The WebView can't tell Compose how tall its content is, so a tiny script
     // reports document height through a platform bridge and we size the view to
@@ -1668,6 +1671,7 @@ internal fun HtmlMessageBody(
     ) {
         MailWebViewWithLinkMenu(
             html = mobileHtml,
+            mediaMissing = mediaMissing,
             onContentHeight = { contentHeightDp = clampMailBodyHeight(it).value },
             onOverflowExtent = { extent, width ->
                 savedOverflowLayout = overflowLayout
@@ -1699,11 +1703,13 @@ private fun MailWebViewWithLinkMenu(
     modifier: Modifier,
     fitWideContent: Boolean,
     transparentBackground: Boolean,
+    mediaMissing: Int,
 ) {
     var menuTarget by remember { mutableStateOf<MessageLinkMenuTarget?>(null) }
     Box(modifier) {
         MailWebView(
             html = html,
+            mediaMissing = mediaMissing,
             onContentHeight = onContentHeight,
             onOverflowExtent = onOverflowExtent,
             onOpenUrl = onOpenUrl,

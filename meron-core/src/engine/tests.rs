@@ -1,9 +1,10 @@
 use super::{
-    Pooled, SENT_COPY_MATCH_WINDOW_SECS, SearchContinuation, batch_placement,
+    Pooled, SENT_COPY_MATCH_WINDOW_SECS, SearchContinuation, TransferTimedOut, batch_placement,
     cached_archive_folder_from_folders, cached_search_mail_page, companion_folders,
     continue_search_page, find_role_folder, limit_prefetch_uids, parse_background_sync_timeout,
-    pool_return, pool_take, record_search_folder_result, sent_copy_landed, should_append_sent_copy,
-    store_folder_tail, thread_gap_search_folders,
+    pool_return, pool_take, prefetch::prefetch_failure_is_the_messages,
+    record_search_folder_result, sent_copy_landed, should_append_sent_copy, store_folder_tail,
+    thread_gap_search_folders,
 };
 use crate::{imap, parse};
 use rusqlite::{Connection, params};
@@ -208,6 +209,21 @@ pub fn thread_gap_search_folders_dedup_case_insensitively() {
         Some("drafts".to_string()),
     );
     assert_eq!(folders, vec!["INBOX", "Drafts"]);
+}
+
+#[test]
+pub fn prefetch_blames_a_message_only_for_failures_of_its_own() {
+    // Too slow for its budget, or refused by the server: the message's.
+    assert!(prefetch_failure_is_the_messages(
+        &TransferTimedOut(Duration::from_secs(120)).into()
+    ));
+    assert!(prefetch_failure_is_the_messages(&anyhow::anyhow!(
+        "UID FETCH: no such message"
+    )));
+    // The connection went away: says nothing about the message.
+    assert!(!prefetch_failure_is_the_messages(&anyhow::Error::new(
+        async_imap::error::Error::ConnectionLost
+    )));
 }
 
 #[test]
@@ -818,4 +834,297 @@ fn moved_copy_uids_picks_only_the_copies_a_move_created() {
     let moved = [id("<twin@example.com>"), id("<twin@example.com>")];
     assert_eq!(moved_copy_uids(&twins, &moved), vec![20, 21]);
     assert!(moved_copy_uids(&twins, &moved[..1]).is_empty());
+}
+
+#[tokio::test]
+async fn transfer_deadline_bounds_credential_wait_without_cancelling_refresh() {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    struct RefreshHost(Arc<tokio::sync::Notify>);
+    impl super::EngineHost for RefreshHost {
+        fn open_db(&self) -> anyhow::Result<Connection> {
+            crate::store::open_at(":memory:")
+        }
+        fn apply_secret(&self, _: &Connection, _: &str, _: &mut imap::Creds) {}
+        fn store_secret(
+            &self,
+            _: &Connection,
+            _: &str,
+            secret: &crate::secrets::Secrets,
+        ) -> anyhow::Result<()> {
+            assert_eq!(secret.access_token.as_deref(), Some("refreshed"));
+            self.0.notify_one();
+            Ok(())
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        started_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let body = r#"{"access_token":"refreshed","expires_in":3600}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let persisted = Arc::new(tokio::sync::Notify::new());
+    let engine = Arc::new(super::Engine::new(Box::new(RefreshHost(persisted.clone()))).unwrap());
+    let mut creds = {
+        let db = engine.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO accounts(id, config) VALUES('acc', ?1)",
+            [r#"{"host":"localhost","user":"u","proxy":{"mode":"direct"}}"#],
+        )
+        .unwrap();
+        crate::store::load_account(&db, "acc").unwrap().unwrap()
+    };
+    creds.auth_type = "gmail_oauth".into();
+    creds.refresh_token = Some("refresh".into());
+    creds.oauth_client_id = "client".into();
+    creds.oauth_token_url = format!("http://{address}/token");
+    engine.accounts.lock().await.insert("acc".into(), creds);
+    let waiter = tokio::spawn({
+        let engine = engine.clone();
+        async move {
+            engine
+                .with_transfer_session("acc", Duration::from_millis(200), |_| {
+                    Box::pin(async { Ok(()) })
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(err.to_string().contains("session preparation timed out"));
+    assert!(!err.is::<TransferTimedOut>());
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), persisted.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        engine.accounts.lock().await["acc"].access_token.as_deref(),
+        Some("refreshed")
+    );
+    assert!(
+        crate::store::load_accounts(&engine.db.lock().unwrap()).unwrap()[0]
+            .1
+            .token_expires_at
+            > 0
+    );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn pooled_transfer_server_no_is_retried_once_fresh() {
+    pooled_transfer_recovery(false, false, false).await;
+}
+
+#[tokio::test]
+async fn stale_pooled_transfer_reuses_a_session_returned_during_coordination() {
+    pooled_transfer_recovery(true, false, false).await;
+}
+
+#[tokio::test]
+async fn pooled_transfer_command_is_not_run_a_third_time() {
+    pooled_transfer_recovery(true, true, false).await;
+}
+
+#[tokio::test]
+async fn read_with_a_second_stale_pooled_session_reconnects_before_retrying_the_command() {
+    pooled_transfer_recovery(true, false, true).await;
+}
+
+async fn pooled_transfer_recovery(
+    reuse_returned: bool,
+    second_fails: bool,
+    read_with_stale_second: bool,
+) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    struct Host;
+    impl super::EngineHost for Host {
+        fn open_db(&self) -> anyhow::Result<Connection> {
+            crate::store::open_at(":memory:")
+        }
+        fn apply_secret(&self, _: &Connection, _: &str, _: &mut imap::Creds) {}
+        fn store_secret(
+            &self,
+            _: &Connection,
+            _: &str,
+            _: &crate::secrets::Secrets,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let failed = Arc::new(tokio::sync::Notify::new());
+    let server_failed = failed.clone();
+    let server = tokio::spawn(async move {
+        for connection in 0..if read_with_stale_second { 3 } else { 2 } {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = socket.into_split();
+            writer.write_all(b"* OK ready\r\n").await.unwrap();
+            let mut lines = tokio::io::BufReader::new(reader).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let (tag, command) = line.split_once(' ').unwrap();
+                let operation = command.starts_with("SELECT");
+                let fail = ((connection == 0 || second_fails) && operation)
+                    || (read_with_stale_second && connection == 1 && command.starts_with("NOOP"));
+                if connection >= 1 && operation {
+                    writer.write_all(b"* 0 EXISTS\r\n").await.unwrap();
+                }
+                let status = if fail {
+                    "NO genuine server refusal"
+                } else {
+                    "OK done"
+                };
+                writer
+                    .write_all(format!("{tag} {status}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                if fail {
+                    server_failed.notify_one();
+                }
+                if fail || (connection >= 1 && operation) {
+                    break;
+                }
+            }
+        }
+    });
+    let engine = Arc::new(super::Engine::new(Box::new(Host)).unwrap());
+    let creds = {
+        let db = engine.db.lock().unwrap();
+        let config = serde_json::json!({"host":"127.0.0.1", "port":port, "tls":false, "user":"u", "proxy":{"mode":"direct"}}).to_string();
+        db.execute(
+            "INSERT INTO accounts(id, config) VALUES('acc', ?1)",
+            [&config],
+        )
+        .unwrap();
+        crate::store::load_account(&db, "acc").unwrap().unwrap()
+    };
+    engine
+        .accounts
+        .lock()
+        .await
+        .insert("acc".into(), creds.clone());
+    engine.return_pooled("acc", imap::connect(&creds).await.unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let coordination = engine.connect_lock("acc");
+    let guard = if reuse_returned {
+        Some(coordination.lock().await)
+    } else {
+        None
+    };
+    let worker = tokio::spawn({
+        let engine = engine.clone();
+        let calls = calls.clone();
+        async move {
+            if read_with_stale_second {
+                engine
+                    .with_read_session("acc", |session| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            session.select("INBOX").await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+            } else {
+                engine
+                    .with_transfer_session("acc", Duration::from_secs(3), |session| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Box::pin(async move {
+                            session.select("INBOX").await?;
+                            Ok(())
+                        })
+                    })
+                    .await
+            }
+        }
+    });
+    if reuse_returned {
+        tokio::time::timeout(Duration::from_secs(1), failed.notified())
+            .await
+            .unwrap();
+        engine.return_pooled("acc", imap::connect(&creds).await.unwrap());
+    }
+    drop(guard);
+    let result = worker.await.unwrap();
+    if second_fails {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("genuine server refusal")
+        );
+    } else {
+        result.unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn transfer_deadline_bounds_connection_coordination() {
+    struct Host;
+    impl super::EngineHost for Host {
+        fn open_db(&self) -> anyhow::Result<Connection> {
+            crate::store::open_at(":memory:")
+        }
+        fn apply_secret(&self, _: &Connection, _: &str, _: &mut imap::Creds) {}
+        fn store_secret(
+            &self,
+            _: &Connection,
+            _: &str,
+            _: &crate::secrets::Secrets,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+    let engine = super::Engine::new(Box::new(Host)).unwrap();
+    let coordination = engine.connect_lock("acc");
+    let _connect_guard = coordination.lock().await;
+    let _accounts_guard = engine.accounts.lock().await;
+    let err = tokio::time::timeout(
+        Duration::from_millis(500),
+        engine.with_transfer_session::<(), _>("acc", Duration::from_millis(50), |_| {
+            Box::pin(async { panic!("No command should run before preparation succeeds") })
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(err.to_string().contains("session preparation timed out"));
+    assert!(!err.is::<TransferTimedOut>());
 }

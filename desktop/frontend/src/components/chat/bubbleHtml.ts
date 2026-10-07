@@ -10,12 +10,15 @@ import {
   darkensCanvas,
   disownStyleElements,
   frameCanvas,
+  frameCanvasAsync,
+  type FrameCanvas,
   frameVar,
   frameVarPrefix,
   ownStyleElement,
   declaredCanvas,
   frameCanvasBackground,
   setDarkened,
+  setDarkenedAsync,
   type BubbleTheme,
 } from './frameTheme'
 
@@ -23,45 +26,106 @@ import {
 export const FRAME_GENERATION_MARKER = 'data-meron-generation'
 
 /**
- * Give a not-yet-loaded image the box its width and height attributes describe.
+ * Hold the place of a picture that has not loaded, from its width and height
+ * attributes. Returns whether it did, so the caller can give the place back.
  *
- * The frame stylesheet sets `height: auto`, so without this an image contributes
- * nothing until its bytes arrive. `height="auto"` is not a length: those
- * pictures paint into the message as they arrive, and the frame grows with them.
+ * `auto`: once the picture loads its own proportions win, so mislabelled
+ * attributes only last until then. A sender's inline ratio is preserved;
+ * browser-derived ratios still get the same explicit reservation.
  */
-export function reserveImageBoxes(doc: Document) {
-  for (const el of doc.querySelectorAll<HTMLElement>('img[width][height], video[width][height]')) {
-    if (el.style.aspectRatio) continue
-    const width = plainLength(el.getAttribute('width'))
-    const height = plainLength(el.getAttribute('height'))
-    if (width === null || height === null) continue
-    // `auto`: once the picture has loaded its own proportions win, as they do
-    // without this. The attributes of a stretched or mislabelled picture only
-    // hold its place until then.
-    el.style.aspectRatio = `auto ${width} / ${height}`
-  }
+export function reserveImageBox(image: HTMLImageElement | HTMLVideoElement): boolean {
+  const width = plainLength(image.getAttribute('width'))
+  const height = plainLength(image.getAttribute('height'))
+  if (width === null || height === null) return false
+  const current = image.style.aspectRatio || image.ownerDocument.defaultView?.getComputedStyle(image).aspectRatio
+  // Browsers derive `auto w / h` from attributes; a fixed authored ratio
+  // keeps its own proportions instead of being overwritten.
+  if (current && current !== 'auto' && !/^auto\s/.test(current)) return false
+  image.style.aspectRatio = `auto ${width} / ${height}`
+  return true
 }
 
-/**
- * Ask again for every picture in `doc` whose request already failed.
- *
- * The attribute is dropped and put back, not assigned its own value: the URL is
- * the same one that failed, and an unchanged `src` is not a reason to load.
- */
-export function reloadFailedImages(doc: Document) {
-  for (const image of doc.querySelectorAll<HTMLImageElement>('img[src]')) {
-    if (!image.complete || image.naturalWidth > 0) continue
-    const src = image.getAttribute('src')
-    if (!src) continue
-    image.removeAttribute('src')
-    image.setAttribute('src', src)
+const IMAGE_BOX_PROPERTIES = ['aspect-ratio', 'width', 'height', 'min-width', 'min-height'] as const
+const failedImageBoxes = new WeakMap<
+  HTMLImageElement,
+  {
+    attributes: Array<[string, string | null]>
+    declarations: Array<[string, string, string]>
   }
+>()
+
+/** Release both browser-derived and explicit dimensions after a failed image. */
+export function releaseFailedImageBox(image: HTMLImageElement) {
+  if (!failedImageBoxes.has(image)) {
+    failedImageBoxes.set(image, {
+      attributes: ['width', 'height'].map((name) => [name, image.getAttribute(name)]),
+      declarations: IMAGE_BOX_PROPERTIES.map((name) => [
+        name,
+        image.style.getPropertyValue(name),
+        image.style.getPropertyPriority(name),
+      ]),
+    })
+  }
+  image.style.setProperty('aspect-ratio', 'auto', 'important')
+  image.style.setProperty('width', 'auto', 'important')
+  image.style.setProperty('height', 'auto', 'important')
+  image.style.setProperty('min-width', '0', 'important')
+  image.style.setProperty('min-height', '0', 'important')
+  image.removeAttribute('width')
+  image.removeAttribute('height')
 }
 
+/** Restore the sender's box only after an image actually arrives. */
+export function restoreImageBox(image: HTMLImageElement) {
+  const saved = failedImageBoxes.get(image)
+  if (!saved) return
+  for (const [name, value] of saved.attributes) {
+    if (value === null) image.removeAttribute(name)
+    else image.setAttribute(name, value)
+  }
+  for (const [name, value, priority] of saved.declarations) {
+    if (value) image.style.setProperty(name, value, priority)
+    else image.style.removeProperty(name)
+  }
+  failedImageBoxes.delete(image)
+}
+
+// A bare number of pixels: a percentage is not a length a box can be built from.
 function plainLength(value: string | null): number | null {
   if (!value || !/^\d+(\.\d+)?$/.test(value.trim())) return null
   const parsed = Number(value)
   return parsed > 0 ? parsed : null
+}
+
+const pendingImageRetries = new WeakMap<HTMLImageElement, () => void>()
+
+/** Retry failed pictures, including pending requests that fail after recovery. */
+export function reloadFailedImages(doc: Document) {
+  for (const image of doc.querySelectorAll<HTMLImageElement>('img[src]')) {
+    if (image.complete && image.naturalWidth > 0) continue
+    // A second recovery while this request is pending still needs only one retry.
+    pendingImageRetries.get(image)?.()
+    const retry = () => {
+      cleanup()
+      if (image.naturalWidth > 0) return
+      const src = image.getAttribute('src')
+      if (!src) return
+      // An unchanged src is not a reason for the browser to load again.
+      image.removeAttribute('src')
+      image.setAttribute('src', src)
+    }
+    const cleanup = () => {
+      image.removeEventListener('error', retry)
+      image.removeEventListener('load', cleanup)
+      pendingImageRetries.delete(image)
+    }
+    if (image.complete) retry()
+    else {
+      pendingImageRetries.set(image, cleanup)
+      image.addEventListener('error', retry, { once: true })
+      image.addEventListener('load', cleanup, { once: true })
+    }
+  }
 }
 
 const DEFAULT_MESSAGE_FRAME_FONT: MessageFrameFont = {
@@ -425,7 +489,7 @@ export function prepareBubbleHtml(
  * were authored for and the palette that goes with it; one that declares nothing
  * is painted in the bubble's colors, so it reads as part of the conversation.
  */
-export function applyBubbleTheme(doc: Document, theme: BubbleTheme) {
+export function applyBubbleTheme(doc: Document, theme: BubbleTheme, preparedCanvas?: FrameCanvas) {
   const style = doc.documentElement.style
   const v = (name: string) => frameVar(frameVarPrefix(doc), name)
   // A light bubble only needs a canvas when the message declared a dark one:
@@ -435,7 +499,7 @@ export function applyBubbleTheme(doc: Document, theme: BubbleTheme) {
     background: canvas,
     text: declaredText,
     framePaints,
-  } = frameCanvas(doc, theme.appearance, LIGHT_ON_DARK_TEXT, needsCanvas)
+  } = preparedCanvas ?? frameCanvas(doc, theme.appearance, LIGHT_ON_DARK_TEXT, needsCanvas)
   const palette = canvas && colorTone(canvas) !== 'dark' ? DEFAULT_BUBBLE_THEME : theme
   const text = declaredText ?? palette.text
 
@@ -465,5 +529,16 @@ export function applyBubbleTheme(doc: Document, theme: BubbleTheme) {
   // an opaque white backdrop from the engine, and the dark palette above ends
   // up as light text on white. Important, so a sender's `:root` can't undo it.
   style.setProperty('color-scheme', theme.appearance, 'important')
-  setDarkened(doc, darkensCanvas(theme.appearance, theme.darkenStyled, canvas))
+  if (!preparedCanvas) setDarkened(doc, darkensCanvas(theme.appearance, theme.darkenStyled, canvas))
+}
+
+/** Theme large documents in small batches before the first visible measurement. */
+export async function applyBubbleThemeAsync(doc: Document, theme: BubbleTheme, cancelled: () => boolean) {
+  await new Promise<void>((resolve) => window.setTimeout(resolve, 0))
+  if (cancelled()) return
+  const needsCanvas = theme.appearance === 'dark' || colorTone(declaredCanvas(doc).background ?? '') === 'dark'
+  const canvas = await frameCanvasAsync(doc, theme.appearance, LIGHT_ON_DARK_TEXT, needsCanvas, cancelled)
+  if (!canvas || cancelled()) return
+  applyBubbleTheme(doc, theme, canvas)
+  await setDarkenedAsync(doc, darkensCanvas(theme.appearance, theme.darkenStyled, canvas.background), cancelled)
 }

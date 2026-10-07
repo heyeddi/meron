@@ -60,8 +60,8 @@ fn oauth_defaults() -> OAuthDefaults {
 /// Engine state: per-account credentials plus the on-disk store.
 /// Reads serve from SQLite; syncs reconnect to IMAP and refresh stored rows.
 pub struct Engine {
-    pub accounts: Mutex<HashMap<String, imap::Creds>>,
-    pub db: std::sync::Mutex<rusqlite::Connection>,
+    pub accounts: Arc<Mutex<HashMap<String, imap::Creds>>>,
+    pub db: Arc<std::sync::Mutex<rusqlite::Connection>>,
     /// Accounts with a live IDLE task, to avoid spawning duplicates.
     /// Keyed by `account\nfolder` because IMAP IDLE watches one selected mailbox
     /// per connection.
@@ -75,16 +75,22 @@ pub struct Engine {
     /// open would re-open an IMAP connection to re-search for them. Cleared on
     /// restart, which lets a genuinely-late ancestor be retried.
     pub gap_attempts: std::sync::Mutex<HashMap<String, HashSet<String>>>,
-    /// Threads with an in-flight background body fetch, keyed by
-    /// `account|thread_key`, so re-opening a thread while its missing bodies
-    /// are still downloading doesn't spawn a duplicate IMAP fetch run.
+    /// Messages with an in-flight background body fetch, keyed by
+    /// [`message_key`], so re-reads cannot duplicate a download while other
+    /// pages and new messages in the thread remain independently fetchable.
     pub body_fetches: std::sync::Mutex<HashSet<String>>,
-    /// Messages (`account|folder|uid`) whose attachment files were still
-    /// missing after a refetch. A download that did not bring the files back
-    /// is not asked for again in this run, or an open thread would refetch,
-    /// notify and re-read without end. Cleared for a message once its files
-    /// are on disk.
-    pub media_recovery_failed: std::sync::Mutex<HashSet<String>>,
+    /// Messages ([`message_key`]) whose attachment files are not to be
+    /// fetched again yet. `None`: a download arrived and the files were still
+    /// missing, or a successful FETCH omitted the UID (expunged). Another
+    /// download is not known to help, and an open thread would
+    /// otherwise refetch, notify and re-read without end. `Some(until)`: the
+    /// download itself failed, so readers stop waiting on it until then.
+    /// Cleared for a message once its files are on disk.
+    pub media_recovery_hold: std::sync::Mutex<HashMap<String, Option<std::time::Instant>>>,
+    /// Messages ([`message_key`]) the prefetcher leaves to the on-demand
+    /// reader for the rest of this run: each failed to download, then failed
+    /// again straight after other mail had come down on the same connection.
+    pub prefetch_skipped: std::sync::Mutex<HashSet<String>>,
     /// Pulsed when an account is paused so live IDLE watchers wake and re-check
     /// their paused state (and stop) instead of blocking up to the IDLE timeout.
     pub pause_signal: Notify,
@@ -108,7 +114,7 @@ pub struct Engine {
     connect_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Platform integration: opens the SQLite store and loads/stores per-account
     /// secrets (OS keychain on desktop, the keyed DB on mobile).
-    pub host: Box<dyn EngineHost>,
+    pub host: Arc<dyn EngineHost>,
 }
 
 /// Platform hooks the [`Engine`] needs but that differ between the desktop
@@ -220,8 +226,51 @@ pub const MAX_IDLE: Duration = Duration::from_secs(120);
 /// slow but progressing APPEND/SEND mid-command is worse than waiting.
 pub const POOLED_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn transfer_timed_out(budget: Duration) -> anyhow::Error {
-    anyhow::anyhow!("IMAP transfer timed out after {}s", budget.as_secs())
+/// How long a pooled session gets to answer the NOOP that precedes a transfer.
+/// A live server answers in a round trip; a socket that died over a sleep or a
+/// network change says nothing, and every second spent finding that out comes
+/// off the download's budget.
+const TRANSFER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The key the engine's per-message bookkeeping files a message under.
+pub(crate) fn message_key(account: &str, folder: &str, uid: u32) -> String {
+    format!("{}{uid}", folder_key_prefix(account, folder))
+}
+
+/// What every [`message_key`] of one folder starts with.
+pub(crate) fn folder_key_prefix(account: &str, folder: &str) -> String {
+    format!("{account}|{folder}|")
+}
+
+/// A body download ran out of its budget. Typed so callers can tell a message
+/// that is too slow to fetch from a connection that went away.
+#[derive(Debug)]
+pub struct TransferTimedOut(pub Duration);
+
+impl std::fmt::Display for TransferTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "IMAP transfer timed out after {}s", self.0.as_secs())
+    }
+}
+
+impl std::error::Error for TransferTimedOut {}
+
+/// How [`Engine::run_session`] treats the session it runs `f` on.
+#[derive(Clone, Copy)]
+enum SessionUse {
+    /// Mutating. Never interrupted and never run twice, so a connection
+    /// dropped mid-command can't double-apply.
+    Write,
+    /// Read-only. A pooled session that fails, or stalls past
+    /// [`POOLED_READ_TIMEOUT`], is replaced by a fresh one and `f` runs once
+    /// more.
+    Read,
+    /// A read that transfers message bytes, due by `deadline` however many
+    /// connections it takes. See [`Engine::with_transfer_session`].
+    Transfer {
+        deadline: tokio::time::Instant,
+        budget: Duration,
+    },
 }
 
 /// Do not let a wedged fresh handshake make every later operation wait for the
@@ -255,18 +304,19 @@ impl Engine {
             accounts.insert(id, creds);
         }
         Ok(Self {
-            accounts: Mutex::new(accounts),
-            db: std::sync::Mutex::new(conn),
+            accounts: Arc::new(Mutex::new(accounts)),
+            db: Arc::new(std::sync::Mutex::new(conn)),
             watched: std::sync::Mutex::new(HashSet::new()),
             syncing: std::sync::Mutex::new(HashSet::new()),
             gap_attempts: std::sync::Mutex::new(HashMap::new()),
             body_fetches: std::sync::Mutex::new(HashSet::new()),
-            media_recovery_failed: std::sync::Mutex::new(HashSet::new()),
+            media_recovery_hold: std::sync::Mutex::new(HashMap::new()),
+            prefetch_skipped: std::sync::Mutex::new(HashSet::new()),
             pause_signal: Notify::new(),
             resume_signal: Notify::new(),
             pool: std::sync::Mutex::new(HashMap::new()),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
-            host,
+            host: Arc::from(host),
         })
     }
 
@@ -280,19 +330,36 @@ impl Engine {
         store::account_muted(&self.db.lock().unwrap(), account).unwrap_or(false)
     }
 
+    /// Refresh and persist credentials in an owned task. Dropping a read or
+    /// transfer must not cancel a refresh after the provider accepted it.
     pub async fn ensure_valid_creds(&self, account: &str) -> anyhow::Result<imap::Creds> {
-        let mut accounts = self.accounts.lock().await;
+        let accounts = self.accounts.clone();
+        let db = self.db.clone();
+        let host = self.host.clone();
+        let account = account.to_string();
+        tokio::spawn(
+            async move { Self::refresh_creds(&accounts, &db, host.as_ref(), &account).await },
+        )
+        .await?
+    }
+
+    async fn refresh_creds(
+        accounts: &Mutex<HashMap<String, imap::Creds>>,
+        db: &std::sync::Mutex<rusqlite::Connection>,
+        host: &dyn EngineHost,
+        account: &str,
+    ) -> anyhow::Result<imap::Creds> {
+        let mut accounts = accounts.lock().await;
         // Lazily hydrate accounts added out-of-band (the mobile host adds/edits
         // accounts through the stateless command path, not this Engine, so a
         // long-lived foreground Engine can miss them). A no-op on desktop, where
         // the dispatch loop keeps `accounts` authoritative.
         if !accounts.contains_key(account) {
-            let loaded = store::load_accounts(&self.db.lock().unwrap())
+            let loaded = store::load_accounts(&db.lock().unwrap())
                 .ok()
                 .and_then(|rows| rows.into_iter().find(|(id, _)| id == account));
             if let Some((id, mut creds)) = loaded {
-                self.host
-                    .apply_secret(&self.db.lock().unwrap(), &id, &mut creds);
+                host.apply_secret(&db.lock().unwrap(), &id, &mut creds);
                 accounts.insert(id, creds);
             }
         }
@@ -407,10 +474,9 @@ impl Engine {
                 // Persist: token_expires_at to SQLite, the new access token to
                 // the host's secret store (keychain on desktop, keyed DB on mobile).
                 {
-                    let db = self.db.lock().unwrap();
+                    let db = db.lock().unwrap();
                     store::save_account_config(&db, account, creds)?;
-                    self.host
-                        .store_secret(&db, account, &secrets::Secrets::from_creds(creds))?;
+                    host.store_secret(&db, account, &secrets::Secrets::from_creds(creds))?;
                 }
             }
         }
@@ -491,56 +557,53 @@ impl Engine {
     /// [`with_read_session`](Self::with_read_session) /
     /// [`with_write_session`](Self::with_write_session) instead of calling this
     /// directly.
-    pub async fn with_session<T, F>(
+    pub async fn with_session<T, F>(&self, account: &str, retry: bool, f: F) -> anyhow::Result<T>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        let usage = if retry {
+            SessionUse::Read
+        } else {
+            SessionUse::Write
+        };
+        self.run_session(account, usage, f).await
+    }
+
+    async fn run_session<T, F>(
         &self,
         account: &str,
-        retry: bool,
+        usage: SessionUse,
         mut f: F,
     ) -> anyhow::Result<T>
     where
         F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
         T: Send,
     {
-        if let Some(mut session) = self.take_pooled(account) {
-            // Retryable (read-only) ops get a bounded reuse attempt so a dead
-            // pooled connection fails over to the fresh-connect path below
-            // instead of hanging until TCP keepalive notices; see
-            // POOLED_READ_TIMEOUT. Writes must not be interrupted mid-command.
-            let result = if retry {
-                match tokio::time::timeout(POOLED_READ_TIMEOUT, f(&mut session)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "pooled session command timed out after {}s",
-                        POOLED_READ_TIMEOUT.as_secs()
-                    )),
-                }
-            } else {
-                f(&mut session).await
-            };
-            match result {
-                Ok(val) => {
-                    pool_debug(account, "reuse");
-                    self.return_pooled(account, session);
-                    return Ok(val);
-                }
-                Err(err) => {
-                    // Discard the suspect session (do not pool it).
-                    drop(session);
-                    if !retry {
-                        return Err(err);
-                    }
-                    pool_debug(account, "stale-retry");
-                    // Fall through to a fresh connection and try once more.
-                }
+        let mut command_attempted = false;
+        if let Some(session) = self.take_pooled(account) {
+            match self
+                .run_pooled(account, usage, session, &mut f, &mut command_attempted)
+                .await
+            {
+                Some(result) => return result,
+                // Fall through to a fresh connection and try once more.
+                None => pool_debug(account, "stale-retry"),
             }
         }
 
         pool_debug(account, "fresh-connect");
         let connect_lock = self.connect_lock(account);
-        let mut connect_guard =
-            tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
-                .await
-                .ok();
+        let mut connect_guard = tokio::time::timeout(
+            match usage {
+                SessionUse::Transfer { deadline, .. } => connect_coordination_timeout()
+                    .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                _ => connect_coordination_timeout(),
+            },
+            connect_lock.lock(),
+        )
+        .await
+        .ok();
         if connect_guard.is_none() {
             crate::mlog!(
                 crate::log::Level::Warn,
@@ -550,41 +613,51 @@ impl Engine {
         }
         // The task ahead of us may have completed its operation and returned the
         // session while we waited for its handshake coordinator.
-        let pooled_after_wait = self.take_pooled(account);
-        if let Some(mut session) = pooled_after_wait {
+        if let Some(session) = self.take_pooled(account) {
             drop(connect_guard.take());
-            let result = if retry {
-                match tokio::time::timeout(POOLED_READ_TIMEOUT, f(&mut session)).await {
-                    Ok(result) => result,
-                    Err(_) => Err(anyhow::anyhow!(
-                        "pooled session command timed out after {}s",
-                        POOLED_READ_TIMEOUT.as_secs()
-                    )),
-                }
-            } else {
-                f(&mut session).await
-            };
-            match result {
-                Ok(value) => {
-                    self.return_pooled(account, session);
-                    return Ok(value);
-                }
-                Err(error) => {
-                    drop(session);
-                    if !retry {
-                        return Err(error);
-                    }
+            match self
+                .run_pooled(account, usage, session, &mut f, &mut command_attempted)
+                .await
+            {
+                Some(result) => return result,
+                None => {
                     pool_debug(account, "stale-retry");
-                    connect_guard =
-                        tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
-                            .await
-                            .ok();
+                    connect_guard = tokio::time::timeout(
+                        match usage {
+                            SessionUse::Transfer { deadline, .. } => connect_coordination_timeout()
+                                .min(
+                                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                                ),
+                            _ => connect_coordination_timeout(),
+                        },
+                        connect_lock.lock(),
+                    )
+                    .await
+                    .ok();
                 }
             }
         }
-        let creds = self.ensure_valid_creds(account).await?;
+        // The caller's wait is bounded. ensure_valid_creds owns a spawned task,
+        // so cancellation still lets a rotated token reach durable storage.
+        let creds = match usage {
+            SessionUse::Transfer { deadline, .. } => {
+                tokio::time::timeout_at(deadline, self.ensure_valid_creds(account))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("IMAP session preparation timed out"))??
+            }
+            _ => self.ensure_valid_creds(account).await?,
+        };
         let connect_started = std::time::Instant::now();
-        let mut session = imap::connect(&creds).await?;
+        let mut session = match usage {
+            // Not `TransferTimedOut`: no transfer started, and callers read
+            // that one as the message being too slow to download.
+            SessionUse::Transfer { deadline, .. } => {
+                tokio::time::timeout_at(deadline, imap::connect(&creds))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("IMAP connect timed out"))??
+            }
+            SessionUse::Write | SessionUse::Read => imap::connect(&creds).await?,
+        };
         let connect_ms = connect_started.elapsed().as_millis();
         if connect_ms > 2_000 {
             crate::mlog!(
@@ -594,12 +667,98 @@ impl Engine {
             );
         }
         drop(connect_guard);
-        match f(&mut session).await {
-            Ok(val) => {
-                self.return_pooled(account, session);
-                Ok(val)
+        let result = match usage {
+            SessionUse::Transfer { deadline, budget } => {
+                match tokio::time::timeout_at(deadline, f(&mut session)).await {
+                    Ok(result) => result,
+                    Err(_) => Err(TransferTimedOut(budget).into()),
+                }
             }
-            Err(err) => Err(err),
+            SessionUse::Write | SessionUse::Read => f(&mut session).await,
+        };
+        // A failed or timed-out command leaves the socket mid-command. Drop it
+        // instead of returning it to the pool.
+        let val = result?;
+        self.return_pooled(account, session);
+        Ok(val)
+    }
+
+    /// Run `f` on a pooled session. `None` means the session was stale (it has
+    /// been dropped) and the caller should connect fresh and run `f` again.
+    async fn run_pooled<T, F>(
+        &self,
+        account: &str,
+        usage: SessionUse,
+        mut session: imap::Session,
+        f: &mut F,
+        command_attempted: &mut bool,
+    ) -> Option<anyhow::Result<T>>
+    where
+        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
+        T: Send,
+    {
+        let may_retry = !*command_attempted;
+        let result = match usage {
+            // Writes must not be interrupted mid-command.
+            SessionUse::Write => f(&mut session).await,
+            // A bounded reuse attempt, so a dead pooled connection fails over
+            // to a fresh one instead of hanging until TCP keepalive notices.
+            SessionUse::Read => {
+                // A second pooled checkout may also be stale after a network
+                // change. Reject it before spending the command's only retry.
+                if !may_retry {
+                    let probe = tokio::time::timeout(
+                        TRANSFER_PROBE_TIMEOUT,
+                        session.run_command_and_check_ok("NOOP"),
+                    )
+                    .await;
+                    if !matches!(probe, Ok(Ok(()))) {
+                        return None;
+                    }
+                }
+                *command_attempted = true;
+                match tokio::time::timeout(POOLED_READ_TIMEOUT, f(&mut session)).await {
+                    Ok(result) => result,
+                    Err(_) if may_retry => return None,
+                    Err(_) => return Some(Err(anyhow::anyhow!("pooled IMAP read timed out"))),
+                }
+            }
+            // The short timeout covers a NOOP only: enough to notice a dead
+            // socket without cutting a slow download short.
+            SessionUse::Transfer { deadline, budget } => {
+                let probe = tokio::time::timeout_at(
+                    deadline,
+                    tokio::time::timeout(
+                        TRANSFER_PROBE_TIMEOUT,
+                        session.run_command_and_check_ok("NOOP"),
+                    ),
+                )
+                .await;
+                if !matches!(probe, Ok(Ok(Ok(())))) {
+                    return None;
+                }
+                *command_attempted = true;
+                match tokio::time::timeout_at(deadline, f(&mut session)).await {
+                    Ok(result) => result,
+                    // Alive, only slow: starting over would not be faster.
+                    Err(_) => return Some(Err(TransferTimedOut(budget).into())),
+                }
+            }
+        };
+        match result {
+            Ok(val) => {
+                pool_debug(account, "reuse");
+                self.return_pooled(account, session);
+                Some(Ok(val))
+            }
+            // Discard the suspect session (do not pool it).
+            Err(err) => match usage {
+                SessionUse::Write => Some(Err(err)),
+                SessionUse::Read | SessionUse::Transfer { .. } if may_retry => None,
+                // A session returned during coordination can serve the retry,
+                // but its command failure must not trigger a third execution.
+                SessionUse::Read | SessionUse::Transfer { .. } => Some(Err(err)),
+            },
         }
     }
 
@@ -615,117 +774,30 @@ impl Engine {
 
     /// Run a read that transfers message bytes (a body FETCH).
     ///
-    /// [`POOLED_READ_TIMEOUT`] only covers a NOOP on a reused socket, which is
-    /// enough to notice a connection the server has already dropped. The
-    /// download itself gets `budget`. Wrapping the FETCH in the short timeout
-    /// aborts a slow-but-alive transfer and starts it over, which is how a
-    /// large or high-latency message ends up taking twice as long to appear.
+    /// A reused socket is only given a short NOOP to prove it is alive.
+    /// Wrapping the FETCH itself in [`POOLED_READ_TIMEOUT`] aborts a
+    /// slow-but-alive transfer and starts it over, which is how a large or
+    /// high-latency message ends up taking twice as long to appear.
     ///
-    /// Like [`with_read_session`](Self::with_read_session), a pooled session
-    /// that fails is replaced by a fresh one and `f` runs once more. Running
-    /// out of `budget` is not retried: the transfer was alive, only slow.
+    /// `budget` is for the whole call: the probe, the wait for a reconnect,
+    /// the handshake, credential wait and a second run of `f` all come out of
+    /// it. A spawned credential refresh continues if this caller times out.
+    /// Running out mid-transfer fails with [`TransferTimedOut`]. `f` runs
+    /// at most twice on pooled command errors. A session returned during
+    /// coordination can serve the retry; otherwise a fresh connection does.
     pub async fn with_transfer_session<T, F>(
         &self,
         account: &str,
         budget: Duration,
-        mut f: F,
+        f: F,
     ) -> anyhow::Result<T>
     where
         F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
         T: Send,
     {
-        if let Some(session) = self.take_pooled(account)
-            && let Some(result) = self
-                .transfer_on_pooled(account, budget, session, &mut f)
-                .await
-        {
-            return result;
-        }
-
-        pool_debug(account, "fresh-connect");
-        let connect_lock = self.connect_lock(account);
-        let mut connect_guard =
-            tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
-                .await
-                .ok();
-        if connect_guard.is_none() {
-            crate::mlog!(
-                crate::log::Level::Warn,
-                "net",
-                "fresh-connect coordination timed out for {account}; connecting independently"
-            );
-        }
-        // The task ahead of us may have completed its operation and returned the
-        // session while we waited for its handshake coordinator.
-        if let Some(session) = self.take_pooled(account) {
-            drop(connect_guard.take());
-            if let Some(result) = self
-                .transfer_on_pooled(account, budget, session, &mut f)
-                .await
-            {
-                return result;
-            }
-            connect_guard =
-                tokio::time::timeout(connect_coordination_timeout(), connect_lock.lock())
-                    .await
-                    .ok();
-        }
-        let creds = self.ensure_valid_creds(account).await?;
-        let connect_started = std::time::Instant::now();
-        let mut session = imap::connect(&creds).await?;
-        let connect_ms = connect_started.elapsed().as_millis();
-        if connect_ms > 2_000 {
-            crate::mlog!(
-                crate::log::Level::Warn,
-                "net",
-                "slow IMAP connect for {account}: {connect_ms}ms"
-            );
-        }
-        drop(connect_guard);
-        match tokio::time::timeout(budget, f(&mut session)).await {
-            Ok(Ok(val)) => {
-                self.return_pooled(account, session);
-                Ok(val)
-            }
-            // A failed or timed-out transfer leaves the socket mid-command.
-            // Drop it instead of returning it to the pool.
-            Ok(Err(err)) => Err(err),
-            Err(_) => Err(transfer_timed_out(budget)),
-        }
-    }
-
-    /// Run a transfer on a pooled session. `None` means the session was stale
-    /// (it was dropped) and the caller should connect fresh and run `f` again.
-    async fn transfer_on_pooled<T, F>(
-        &self,
-        account: &str,
-        budget: Duration,
-        mut session: imap::Session,
-        f: &mut F,
-    ) -> Option<anyhow::Result<T>>
-    where
-        F: FnMut(&mut imap::Session) -> SessionOp<'_, T> + Send,
-        T: Send,
-    {
-        let probe = tokio::time::timeout(POOLED_READ_TIMEOUT, session.noop()).await;
-        if !matches!(probe, Ok(Ok(()))) {
-            pool_debug(account, "stale-retry");
-            return None;
-        }
-        match tokio::time::timeout(budget, f(&mut session)).await {
-            Ok(Ok(val)) => {
-                pool_debug(account, "reuse");
-                self.return_pooled(account, session);
-                Some(Ok(val))
-            }
-            // The socket answered the probe and then failed: it may have died
-            // in between, which a fresh connection gets past.
-            Ok(Err(_)) => {
-                pool_debug(account, "stale-retry");
-                None
-            }
-            Err(_) => Some(Err(transfer_timed_out(budget))),
-        }
+        let deadline = tokio::time::Instant::now() + budget;
+        self.run_session(account, SessionUse::Transfer { deadline, budget }, f)
+            .await
     }
 
     /// Run a mutating operation against a pooled (or fresh) session. Never

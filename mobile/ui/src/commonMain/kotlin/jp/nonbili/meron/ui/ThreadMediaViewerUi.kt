@@ -149,10 +149,11 @@ internal fun AsyncAttachmentImage(
     contentDescription: String,
     modifier: Modifier,
     contentScale: ContentScale,
+    retryKey: Int = 0,
 ) {
     var bitmap by remember(attachment.key, attachment.url, ref) { mutableStateOf<ImageBitmap?>(null) }
-    LaunchedEffect(attachment.key, attachment.url, ref) {
-        bitmap = loadImageAttachment(attachment) ?: loadImageBitmapRef(ref)
+    LaunchedEffect(attachment.key, attachment.url, ref, retryKey) {
+        if (bitmap == null) bitmap = loadImageAttachment(attachment) ?: loadImageBitmapRef(ref)
     }
     val image = bitmap
     if (image != null) {
@@ -480,6 +481,7 @@ internal fun AttachmentImageGrid(
     // a chat bubble that shrinks to its images.
     columns: Int = 3,
     modifier: Modifier = Modifier,
+    mediaMissing: Int = 0,
 ) {
     val rows = remember(images, columns) { images.chunked(columns) }
     Column(modifier, verticalArrangement = Arrangement.spacedBy(AttachmentImageGridGap)) {
@@ -497,6 +499,7 @@ internal fun AttachmentImageGrid(
                     ) {
                         AsyncAttachmentImage(
                             attachment = attachment,
+                            retryKey = mediaMissing,
                             ref = attachmentMediaRef(attachment),
                             loadImageAttachment = loadImageAttachment,
                             contentDescription = attachment.filename.ifBlank { "Image" },

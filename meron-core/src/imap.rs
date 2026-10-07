@@ -1949,15 +1949,19 @@ pub const BODY_FETCH_BATCH: usize = 4;
 /// Select `folder` and fetch full bodies for `uids`, parsing each into a
 /// `Message`. Used by the thread reader and the body prefetcher. `peek` so
 /// reading doesn't flip server-side `\Seen`.
+///
+/// Each message goes to `on_message` as it arrives rather than into a returned
+/// list, so a caller keeps what was downloaded before an error or a deadline
+/// cut the rest short.
 pub async fn fetch_bodies(
     session: &mut Session,
     folder: &str,
     uids: &[u32],
     media_root: std::path::PathBuf,
     account: &str,
-) -> Result<Vec<(u32, parse::Message)>> {
+    on_message: &mut (dyn FnMut(u32, parse::Message) + Send),
+) -> Result<()> {
     session.select(folder).await.context("SELECT")?;
-    let mut out = Vec::new();
     for chunk in uids.chunks(BODY_FETCH_BATCH) {
         if chunk.is_empty() {
             continue;
@@ -1983,11 +1987,11 @@ pub async fn fetch_bodies(
             };
             let mut parsed = parse::parse_message(body, Some(&media));
             parsed.date = message_date(parsed.date, &fetch);
-            out.push((uid, parsed));
+            on_message(uid, parsed);
         }
         drop(stream);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// IMAP SEARCH key for the body prefetcher: every message received since

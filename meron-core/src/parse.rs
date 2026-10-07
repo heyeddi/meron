@@ -1156,13 +1156,20 @@ fn write_media(
 /// SQLite, and a key-less attachment — a row cached before attachments were
 /// persisted to disk, whose bytes were never written and must be fetched now.
 pub fn cached_media_available(root: &Path, message: &Message) -> bool {
+    missing_media_count(root, message) == 0
+}
+
+/// How many of a cached message's attachments have no file on disk: pruned,
+/// never written, or cached before their keys were kept.
+pub fn missing_media_count(root: &Path, message: &Message) -> usize {
     message
         .attachments
         .iter()
-        .all(|att| match att.key.as_deref() {
-            Some(key) => root.join(key).is_file(),
-            None => false,
+        .filter(|att| match att.key.as_deref() {
+            Some(key) => !root.join(key).is_file(),
+            None => true,
         })
+        .count()
 }
 
 /// Keep the shared media cache under its configured cap by removing oldest files
